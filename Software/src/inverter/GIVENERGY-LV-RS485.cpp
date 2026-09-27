@@ -34,13 +34,15 @@ constexpr int kCells = 16;
 // of charge; we mirror that so an LFP pack reaches its voltage knee at low current instead of
 // letting the inverter's own ~58 V over-voltage trip do the job (it reads ~1.3 V above the pack
 // at 60 A, so a hard cutoff at full current would trip it well before the pack is actually full).
-constexpr uint16_t kTaperStart_mV = 3450;  // taper begins here: no reduction below this
-constexpr uint16_t kTaperEnd_mV = 3550;    // taper reaches the trickle rate here
-constexpr uint16_t kTrickle_cA = 300;      // 3 A trickle from kTaperEnd_mV to kCellStop_mV: lets
-                                           // the BMS balance the top cells without stalling
-constexpr uint16_t kCellStop_mV = 3600;    // charging stops here: belt and braces, since
-                                           // Battery-Emulator's own cell over-voltage check
-                                           // isn't effective for this battery module
+constexpr uint16_t kTaperStart_mV = 3450;     // taper begins here: no reduction below this
+constexpr uint16_t kTaperEnd_mV = 3550;       // taper reaches the trickle rate here
+constexpr uint16_t kTrickle_cA = 300;         // 3 A trickle from kTaperEnd_mV to kCellStop_mV: lets
+                                              // the BMS balance the top cells without stalling
+constexpr uint16_t kCellStop_mV = 3600;       // charging stops here: belt and braces, since
+                                              // Battery-Emulator's own cell over-voltage check
+                                              // isn't effective for this battery module
+constexpr uint16_t kCellUnderStop_mV = 2900;  // LFP low-cell stop: backup to the battery's own
+                                              // discharge limit already going to 0
 
 uint16_t clamp_cell(uint16_t mV) {
   return std::min(std::max(mV, kCellMin_mV), kCellMax_mV);
@@ -247,5 +249,22 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   fill_cells(s);
   s.temp_max_dC = t_max;
   s.temp_min_dC = t_min;
+
+  // HR20 alarm bits: emulating the DSP firmware showed bit 2 (over-voltage) drops its charge
+  // bound to 0 outside a calibration, and to ~180 W during one, lower than the 8 A floor a zero
+  // HR26 leaves; bit 3 (under-voltage) cuts discharge to 10%. Neither faults or latches. My real
+  // battery raised bit 2 for 271 s at 57.5 V during a 3 A top-up at 99% SoC - it uses bit 2 as its
+  // over-voltage stop, so this module raises it where HR26 already goes to 0 (the taper's own
+  // stop, or the user's charge-voltage ceiling), and bit 3 at kCellUnderStop_mV, as backups to
+  // HR26/HR27 going to 0.
+  const bool fault = datalayer.system.status.system_status == FAULT;
+  const bool user_ceiling_reached = datalayer.battery_settings.user_set_voltage_limits_active &&
+                                    agg.voltage_dV >= datalayer.battery_settings.max_user_set_charge_voltage_dV;
+  if (fault || agg.cell_max_voltage_mV >= kCellStop_mV || user_ceiling_reached) {
+    s.alarms |= 0x0004;
+  }
+  if (fault || agg.cell_min_voltage_mV <= kCellUnderStop_mV) {
+    s.alarms |= 0x0008;
+  }
   return s;
 }
