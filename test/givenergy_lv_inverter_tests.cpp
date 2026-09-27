@@ -58,6 +58,10 @@ class GivEnergyLvInverter : public ::testing::Test {
     // A real pack voltage, so update_values() marks the module ready to reply. Tests that care
     // about the not-ready state override this back to 0 before constructing the inverter.
     datalayer.battery.status.voltage_dV = 520;
+    // A normal mid-charge cell voltage, below the taper (see ChargeTaper* tests below): without
+    // this, DataLayer's cell_max_voltage_mV default of 3700 mV would taper HR26 to 0 in every
+    // test here that doesn't set the aggregate cell voltages itself.
+    datalayer.aggregate.cell_max_voltage_mV = 3300;
   }
 };
 
@@ -235,6 +239,40 @@ TEST_F(GivEnergyLvInverter, LimitsAreCappedAt90A) {
   const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
   EXPECT_EQ(s.charge_limit_cA, 9000);
   EXPECT_EQ(s.discharge_limit_cA, 9000);
+}
+
+TEST_F(GivEnergyLvInverter, ChargeTaperFollowsTheHighestCell) {
+  datalayer.aggregate.max_charge_current_dA = 1000;  // 100 A, capped to 9000 before any taper
+  datalayer.aggregate.cell_max_voltage_mV = 3400;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 9000);
+  datalayer.aggregate.cell_max_voltage_mV = 3450;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 9000);
+  datalayer.aggregate.cell_max_voltage_mV = 3500;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 4650);
+  datalayer.aggregate.cell_max_voltage_mV = 3549;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 387);
+  datalayer.aggregate.cell_max_voltage_mV = 3550;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 300);
+  datalayer.aggregate.cell_max_voltage_mV = 3599;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 300);
+  datalayer.aggregate.cell_max_voltage_mV = 3600;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 0);
+  datalayer.aggregate.cell_max_voltage_mV = 3650;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().charge_limit_cA, 0);
+}
+
+TEST_F(GivEnergyLvInverter, ChargeTaperNeverRaisesTheBatteryLimit) {
+  datalayer.aggregate.max_charge_current_dA = 20;  // 2.0 A: well under even the untapered limit
+  datalayer.aggregate.cell_max_voltage_mV = 3500;  // deep in the taper band, but that's moot here
+  const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.charge_limit_cA, 200);
+}
+
+TEST_F(GivEnergyLvInverter, ChargeTaperLeavesDischargeAlone) {
+  datalayer.aggregate.cell_max_voltage_mV = 3600;  // taper would zero HR26, but not HR27
+  datalayer.aggregate.max_discharge_current_dA = 800;
+  const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.discharge_limit_cA, 8000);
 }
 
 TEST_F(GivEnergyLvInverter, FaultStopsChargeAndDischarge) {

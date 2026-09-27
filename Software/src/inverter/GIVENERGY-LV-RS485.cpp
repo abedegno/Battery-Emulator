@@ -29,12 +29,42 @@ constexpr uint16_t kCellMin_mV = 2201;
 constexpr uint16_t kCellMax_mV = 3699;
 constexpr int kCells = 16;
 
+// The G3 never takes a charge voltage from the battery: it charges at whatever current HR26
+// allows until HR26 itself comes down. The real GivEnergy BMS cuts HR26 to 3.20 A near the top
+// of charge; we mirror that so an LFP pack reaches its voltage knee at low current instead of
+// letting the inverter's own ~58 V over-voltage trip do the job (it reads ~1.3 V above the pack
+// at 60 A, so a hard cutoff at full current would trip it well before the pack is actually full).
+constexpr uint16_t kTaperStart_mV = 3450;  // taper begins here: no reduction below this
+constexpr uint16_t kTaperEnd_mV = 3550;    // taper reaches the trickle rate here
+constexpr uint16_t kTrickle_cA = 300;      // 3 A trickle from kTaperEnd_mV to kCellStop_mV: lets
+                                           // the BMS balance the top cells without stalling
+constexpr uint16_t kCellStop_mV = 3600;    // charging stops here: belt and braces, since
+                                           // Battery-Emulator's own cell over-voltage check
+                                           // isn't effective for this battery module
+
 uint16_t clamp_cell(uint16_t mV) {
   return std::min(std::max(mV, kCellMin_mV), kCellMax_mV);
 }
 
 uint16_t limit_cA(uint16_t dA) {
   return static_cast<uint16_t>(std::min<uint32_t>(dA * 10u, kLimitCap_cA));
+}
+
+// How far HR26 should be pulled down as the highest cell nears full, independent of what the
+// battery itself is asking for. snapshot_from_datalayer() takes the smaller of this and the
+// battery-derived limit, so the taper can only tighten HR26, never loosen it.
+uint16_t charge_taper_cA(uint16_t max_cell_mV) {
+  if (max_cell_mV >= kCellStop_mV) {
+    return 0;
+  }
+  if (max_cell_mV >= kTaperEnd_mV) {
+    return kTrickle_cA;
+  }
+  if (max_cell_mV <= kTaperStart_mV) {
+    return kLimitCap_cA;
+  }
+  return static_cast<uint16_t>(kLimitCap_cA - (max_cell_mV - kTaperStart_mV) * (kLimitCap_cA - kTrickle_cA) /
+                                                  (kTaperEnd_mV - kTaperStart_mV));
 }
 
 uint16_t saturate16(uint32_t value) {
@@ -193,7 +223,7 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   // battery still holds it at 90 A while it cuts HR26/HR27, so only fault zeroes it too.
   if (datalayer.system.status.system_status != FAULT) {
     s.limit_cA = kLimitCap_cA;
-    s.charge_limit_cA = limit_cA(agg.max_charge_current_dA);
+    s.charge_limit_cA = std::min(limit_cA(agg.max_charge_current_dA), charge_taper_cA(agg.cell_max_voltage_mV));
     s.discharge_limit_cA = limit_cA(agg.max_discharge_current_dA);
   }
 
