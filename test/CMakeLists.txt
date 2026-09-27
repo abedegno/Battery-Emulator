@@ -188,6 +188,7 @@ add_executable(tests
     ../Software/src/inverter/PYLON-CAN.cpp
     ../Software/src/inverter/PYLON-LV-RS485.cpp
     ../Software/src/inverter/GIVENERGY-LV-FRAMES.cpp
+    ../Software/src/inverter/GIVENERGY-LV-RS485.cpp
     ../Software/src/inverter/PYLON-LV-CAN.cpp
     ../Software/src/inverter/SCHNEIDER-CAN.cpp
     ../Software/src/inverter/SMA-BYD-H-CAN.cpp
