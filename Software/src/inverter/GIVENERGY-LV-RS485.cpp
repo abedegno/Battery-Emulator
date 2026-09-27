@@ -189,8 +189,10 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   s.voltage_cV = agg.voltage_dV * 10;
   s.current_cA = static_cast<int16_t>(std::min(std::max(agg.current_dA * 10, -32000), 32000));
   s.temperature_C = agg.temperature_max_dC / 10;
-  s.limit_cA = kLimitCap_cA;
+  // HR25 only matters to a G3 below firmware 3011 (which uses it instead of HR26/HR27); the real
+  // battery still holds it at 90 A while it cuts HR26/HR27, so only fault zeroes it too.
   if (datalayer.system.status.system_status != FAULT) {
+    s.limit_cA = kLimitCap_cA;
     s.charge_limit_cA = limit_cA(agg.max_charge_current_dA);
     s.discharge_limit_cA = limit_cA(agg.max_discharge_current_dA);
   }
