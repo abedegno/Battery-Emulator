@@ -55,6 +55,9 @@ class GivEnergyLvInverter : public ::testing::Test {
   void SetUp() override {
     datalayer = DataLayer();
     set_millis64(1000);
+    // A real pack voltage, so update_values() marks the module ready to reply. Tests that care
+    // about the not-ready state override this back to 0 before constructing the inverter.
+    datalayer.battery.status.voltage_dV = 520;
   }
 };
 
@@ -63,6 +66,7 @@ class GivEnergyLvInverter : public ::testing::Test {
 TEST_F(GivEnergyLvInverter, RepliesAfterTheTurnaround) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
   port.feed(kHrPoll);
   inverter.receive();
   EXPECT_TRUE(port.tx.empty()) << "replied inside the 3.5-character turnaround";
@@ -77,6 +81,7 @@ TEST_F(GivEnergyLvInverter, RepliesAfterTheTurnaround) {
 TEST_F(GivEnergyLvInverter, FindsAPollAfterLineNoise) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
   port.feed({0x00, 0xFF, 0x13, 0x01});
   port.feed(kHrPoll);
   inverter.receive();
@@ -88,6 +93,7 @@ TEST_F(GivEnergyLvInverter, FindsAPollAfterLineNoise) {
 TEST_F(GivEnergyLvInverter, StillWithholdsTheReplyThreeMillisecondsIn) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
   port.feed(kHrPoll);
   inverter.receive();
   set_millis64(1003);
@@ -101,6 +107,7 @@ TEST_F(GivEnergyLvInverter, StillWithholdsTheReplyThreeMillisecondsIn) {
 TEST_F(GivEnergyLvInverter, AssemblesARequestSplitAcrossTwoReceiveCalls) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
   port.feed({kHrPoll.begin(), kHrPoll.begin() + 3});
   inverter.receive();
   port.feed({kHrPoll.begin() + 3, kHrPoll.end()});
@@ -113,6 +120,7 @@ TEST_F(GivEnergyLvInverter, AssemblesARequestSplitAcrossTwoReceiveCalls) {
 TEST_F(GivEnergyLvInverter, IgnoresItsOwnWriteEchoButAnswersALaterRetry) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
   const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
   port.feed(write);
   inverter.receive();
@@ -138,6 +146,7 @@ TEST_F(GivEnergyLvInverter, IgnoresItsOwnWriteEchoButAnswersALaterRetry) {
 TEST_F(GivEnergyLvInverter, IgnoresAnEchoThatArrivesInTheSameCallAsTheSend) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
   const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
   port.feed(write);
   inverter.receive();
@@ -165,6 +174,46 @@ TEST_F(GivEnergyLvInverter, ReplyUsesTheDatalayerFromTheLastUpdate) {
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[3 + 52], 0x13);  // HR26 = 5000 (50.00 A)
   EXPECT_EQ(port.tx[3 + 53], 0x88);
+}
+
+TEST_F(GivEnergyLvInverter, StaysSilentUntilTheBatteryHasReported) {
+  FakeSerial port;
+  datalayer.battery.status.voltage_dV = 0;  // the battery hasn't decoded a pack voltage yet
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(1004);
+  inverter.receive();
+  EXPECT_TRUE(port.tx.empty()) << "replied before the battery had reported a real voltage";
+
+  datalayer.battery.status.voltage_dV = 520;
+  datalayer.aggregate.voltage_dV = 520;
+  inverter.update_values();
+  port.feed(kHrPoll);
+  set_millis64(1100);
+  inverter.receive();
+  set_millis64(1104);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  EXPECT_EQ(port.tx[3 + 44], 0x14);  // HR22 = 5200 (52.00 V)
+  EXPECT_EQ(port.tx[3 + 45], 0x50);
+}
+
+TEST_F(GivEnergyLvInverter, DiscardsRequestsHeardBeforeReady) {
+  FakeSerial port;
+  datalayer.battery.status.voltage_dV = 0;  // the battery hasn't decoded a pack voltage yet
+  GivEnergyLvRs485Inverter inverter(port);
+  port.feed(kHrPoll);
+  inverter.receive();  // parsed and discarded while not ready: never queued as a pending reply
+
+  datalayer.battery.status.voltage_dV = 520;
+  inverter.update_values();
+  set_millis64(1004);
+  inverter.receive();
+  set_millis64(1010);
+  inverter.receive();
+  EXPECT_TRUE(port.tx.empty()) << "answered a request that arrived before the battery was ready";
 }
 
 TEST(GivEnergyLvRegistration, IsListedByName) {
@@ -274,8 +323,8 @@ TEST_F(GivEnergyLvInverter, NoBatteryYetStillGivesInRangeValues) {
   datalayer.aggregate.cell_min_voltage_mV = 0;
   const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
   for (int i = 0; i < 16; i++) {
-    EXPECT_GE(s.cells_mV[i], 2200) << "cell " << i;
-    EXPECT_LE(s.cells_mV[i], 3700) << "cell " << i;
+    EXPECT_GT(s.cells_mV[i], 2200) << "cell " << i;
+    EXPECT_LT(s.cells_mV[i], 3700) << "cell " << i;
   }
   EXPECT_EQ(s.charge_limit_cA, 0);
   EXPECT_EQ(s.discharge_limit_cA, 0);
