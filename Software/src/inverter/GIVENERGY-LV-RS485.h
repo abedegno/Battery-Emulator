@@ -22,13 +22,13 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   int baud_rate() override { return 9600; }
   bool is_echo(uint32_t now_ms) const;
   void handle_request(uint32_t now_ms);
-  void send_reply();
+  void send_reply(uint32_t now_ms);
 
   // Modbus RTU wants 3.5 character times (3.6 ms at 9600) before a reply.
   static constexpr uint32_t kTurnaroundMs = 4;
   // A frame identical to the write echo just sent, this soon after, is the transceiver hearing itself.
   static constexpr uint32_t kEchoWindowMs = 50;
-  // As PYLON-LV-RS485: 12 updates of 5 s without a request raise the missing event.
+  // As PYLON-LV-RS485: 12 updates of 1 s (about 12 s) without a request raise the missing event.
   static constexpr uint8_t RS485_HEALTHY = 12;
 
   HardwareSerial& port_;
@@ -40,7 +40,9 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   uint32_t request_ms_ = 0;
   uint8_t sent_[givenergy_lv::kRequestLen] = {};
   bool sent_write_echo_ = false;
-  uint32_t sent_ms_ = 0;
+  // Deadline past which a frame identical to our last write echo is a genuine retry, not the
+  // transceiver hearing its own transmission: the end of that transmission plus kEchoWindowMs.
+  uint32_t echo_until_ms_ = 0;
   uint8_t incoming_message_counter_ = RS485_HEALTHY;
   bool inverter_detected_ = false;
 };
