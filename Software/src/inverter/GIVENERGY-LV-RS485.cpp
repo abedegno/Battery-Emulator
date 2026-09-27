@@ -23,8 +23,10 @@ uint32_t tx_ms(size_t len) {
 constexpr char kSerial[] = "EM2026G001";
 constexpr uint16_t kFirmware = 3020;     // as my battery; 3011 or higher selects HR26/HR27 on a G3
 constexpr uint16_t kLimitCap_cA = 9000;  // 90 A: the new circuit has a 100 A DC MCB
-constexpr uint16_t kCellMin_mV = 2200;   // the inverter's accepted cell range (docs/05)
-constexpr uint16_t kCellMax_mV = 3700;
+// The inverter accepts cell voltages strictly between 2200 and 3700 mV and silently drops
+// anything outside that (docs/05), so clamp one step inside those bounds, not onto them.
+constexpr uint16_t kCellMin_mV = 2201;
+constexpr uint16_t kCellMax_mV = 3699;
 constexpr int kCells = 16;
 
 uint16_t clamp_cell(uint16_t mV) {
@@ -77,6 +79,14 @@ bool GivEnergyLvRs485Inverter::setup() {
 void GivEnergyLvRs485Inverter::update_values() {
   snapshot_ = snapshot_from_datalayer();
 
+  // datalayer.battery.status.voltage_dV is 0 until the battery module has decoded a real pack
+  // voltage; datalayer.aggregate keeps a 370 V placeholder meanwhile (see datalayer.h). Once the
+  // battery has reported, stay ready even if a later reading is 0 - the FAULT path already zeroes
+  // the limits, so there's nothing unsafe left to hide.
+  if (datalayer.battery.status.voltage_dV != 0) {
+    ready_ = true;
+  }
+
   if (incoming_message_counter_ > 0) {
     incoming_message_counter_--;
   }
@@ -125,6 +135,8 @@ bool GivEnergyLvRs485Inverter::is_echo(uint32_t now_ms) const {
 }
 
 void GivEnergyLvRs485Inverter::handle_request(uint32_t now_ms) {
+  // A valid request means the inverter is alive on the bus even if we're not ready to answer it
+  // yet: don't let a slow battery module get the inverter reported missing.
   incoming_message_counter_ = RS485_HEALTHY;
   if (!inverter_detected_) {
     inverter_detected_ = true;
@@ -134,6 +146,9 @@ void GivEnergyLvRs485Inverter::handle_request(uint32_t now_ms) {
     logging.printf("GivEnergy: inverter wrote %u to register %u of device %u\n",
                    static_cast<unsigned>(rx_[4] << 8 | rx_[5]), static_cast<unsigned>(rx_[2] << 8 | rx_[3]),
                    static_cast<unsigned>(rx_[0]));
+  }
+  if (!ready_) {
+    return;  // no real snapshot yet: stay silent rather than answer with placeholder values
   }
   snapshot_.clock_hash = kClockSeed + now_ms / 1000;
   reply_len_ = givenergy_lv::build_reply(rx_, snapshot_, reply_);

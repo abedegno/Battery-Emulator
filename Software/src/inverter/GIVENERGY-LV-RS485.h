@@ -45,6 +45,10 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   uint32_t echo_until_ms_ = 0;
   uint8_t incoming_message_counter_ = RS485_HEALTHY;
   bool inverter_detected_ = false;
+  // Set once update_values() has seen a real pack voltage from the battery module. Until then,
+  // receive() parses and discards requests without replying, so we never tell the inverter a
+  // DataLayer default (370 V) is the pack voltage. Sticky: once true, stays true.
+  bool ready_ = false;
 };
 
 #endif
