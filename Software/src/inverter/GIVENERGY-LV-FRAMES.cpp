@@ -184,6 +184,9 @@ size_t build_reply(const uint8_t* request, const Snapshot& s, uint8_t* out) {
       }
       return finish(out, 4 + len);
     }
+    case 6:
+      memcpy(out, request, kRequestLen);
+      return kRequestLen;
     default:
       return 0;
   }

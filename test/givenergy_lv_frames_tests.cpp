@@ -183,3 +183,15 @@ TEST(GivEnergyLvFrames, NegativeTemperaturesAreTwosComplement) {
   EXPECT_EQ(block3[4 + 34], 0xFF);
   EXPECT_EQ(block3[4 + 35], 0xCC);
 }
+
+TEST(GivEnergyLvFrames, WritesAreEchoed) {
+  // The inverter retries a write until it sees the echo, stalling the bus.
+  const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
+  EXPECT_EQ(reply_to(write, captured_snapshot()), write);
+}
+
+TEST(GivEnergyLvFrames, DevicesOutsideOneToFiveGetNoReply) {
+  EXPECT_TRUE(reply_to(with_crc({0x00, 0x04, 0x00, 0x00, 0x00, 0x15}), captured_snapshot()).empty());
+  EXPECT_TRUE(reply_to(with_crc({0x06, 0x04, 0x00, 0x00, 0x00, 0x15}), captured_snapshot()).empty());
+  EXPECT_TRUE(reply_to(with_crc({0x06, 0x06, 0x00, 0x02, 0x00, 0x01}), captured_snapshot()).empty());
+}
