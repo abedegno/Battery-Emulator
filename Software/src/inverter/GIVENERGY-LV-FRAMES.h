@@ -16,6 +16,11 @@ constexpr uint8_t kPackDevice = 1;   // the pack; 2 to 5 are empty slots
 constexpr uint8_t kLastDevice = 5;
 constexpr uint16_t kHoldingCount = 28;
 
+// The three input-register blocks the inverter reads from each device.
+constexpr uint16_t kBlock1Start = 0x00, kBlock1Count = 21;
+constexpr uint16_t kBlock2Start = 0x15, kBlock2Count = 19;
+constexpr uint16_t kBlock3Start = 0x28, kBlock3Count = 20;
+
 uint16_t crc16(const uint8_t* data, size_t len);
 
 // True for an 8-byte FC3, FC4 or FC6 request with a valid CRC.
