@@ -244,6 +244,7 @@ TEST_F(GivEnergyLvInverter, FaultStopsChargeAndDischarge) {
   const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
   EXPECT_EQ(s.charge_limit_cA, 0);
   EXPECT_EQ(s.discharge_limit_cA, 0);
+  EXPECT_EQ(s.limit_cA, 0);
 }
 
 TEST_F(GivEnergyLvInverter, StatusBitsFollowTheCurrent) {
