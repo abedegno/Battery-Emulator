@@ -268,19 +268,30 @@ TEST_F(GivEnergyLvInverter, UnitsMatchTheWire) {
   EXPECT_EQ(s.current_mA, -12300);
   EXPECT_EQ(s.soc_pct, 97);
   EXPECT_EQ(s.block2_soc_pct, 97);
-  EXPECT_EQ(s.capacity_Ah, 625);
-  EXPECT_EQ(s.full_capacity_cAh, 62500);
-  EXPECT_EQ(s.design_capacity_cAh, 62500);
-  EXPECT_EQ(s.remaining_cAh, 31250);
+  // The Growatt battery module computes Wh = Ah x measured pack voltage, so converting back
+  // uses that same measured voltage (562 dV = 56.2 V), not a fixed nominal one: 32000 Wh * 1000
+  // / 562 dV = 56939 cAh.
+  EXPECT_EQ(s.capacity_Ah, 569);
+  EXPECT_EQ(s.full_capacity_cAh, 56939);
+  EXPECT_EQ(s.design_capacity_cAh, 56939);
+  EXPECT_EQ(s.remaining_cAh, 28469);
   EXPECT_EQ(s.firmware, 3020);
   EXPECT_STREQ(s.serial, "EM2026G001");
+
+  // A round-numbers pack (33750 Wh at 54.0 V) so the expected cAh is exact.
+  datalayer.aggregate.voltage_dV = 540;
+  datalayer.aggregate.reported_total_capacity_Wh = 33750;
+  const givenergy_lv::Snapshot s2 = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s2.full_capacity_cAh, 62500);
+  EXPECT_EQ(s2.capacity_Ah, 625);
 }
 
-TEST_F(GivEnergyLvInverter, TwoPacksClampTheBlock2Capacity) {
-  datalayer.aggregate.reported_total_capacity_Wh = 64000;
+TEST_F(GivEnergyLvInverter, FullCapacityNoLongerClampsAt16Bits) {
+  datalayer.aggregate.voltage_dV = 512;
+  datalayer.aggregate.reported_total_capacity_Wh = 64000;  // 625 Ah at 51.2 V: two Fogstar packs
   const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
   EXPECT_EQ(s.capacity_Ah, 1250);
-  EXPECT_EQ(s.full_capacity_cAh, 65535);
+  EXPECT_EQ(s.full_capacity_cAh, 125000u);
 }
 
 TEST_F(GivEnergyLvInverter, SubZeroTemperaturesStayNegative) {

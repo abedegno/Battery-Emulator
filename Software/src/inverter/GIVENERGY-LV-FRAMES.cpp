@@ -11,6 +11,11 @@ void put16(uint8_t* p, uint16_t value) {
   p[1] = value & 0xFF;
 }
 
+void put32(uint8_t* p, uint32_t value) {
+  put16(p, static_cast<uint16_t>(value >> 16));
+  put16(p + 2, static_cast<uint16_t>(value & 0xFFFF));
+}
+
 uint16_t get16(const uint8_t* p) {
   return static_cast<uint16_t>(p[0] << 8 | p[1]);
 }
@@ -82,16 +87,15 @@ size_t block1(const Snapshot* s, uint8_t* d) {
 size_t block2(const Snapshot* s, uint8_t* d) {
   memset(d, 0, kBlock2Count * 2);
   if (s) {
-    const uint32_t current = static_cast<uint32_t>(s->current_mA);
     d[0] = s->cell_count;
     put16(d + 1, s->cycles);
     put16(d + 5, s->pack_voltage_mV);
     put16(d + 7, s->cell_sum_mV);
-    put16(d + 9, current >> 16);
-    put16(d + 11, current & 0xFFFF);
-    put16(d + 15, s->full_capacity_cAh);
-    put16(d + 19, s->design_capacity_cAh);
-    put16(d + 23, s->remaining_cAh);
+    put32(d + 9, static_cast<uint32_t>(s->current_mA));
+    // Bytes 13-16, 17-20 and 21-24: u32 BE, 0.01 Ah (bms-analysis docs/03, input registers).
+    put32(d + 13, s->full_capacity_cAh);
+    put32(d + 17, s->design_capacity_cAh);
+    put32(d + 21, s->remaining_cAh);
     d[25] = s->block2_soc_pct;
     put16(d + 28, s->block2_word28);
     put16(d + 32, s->block2_word32);

@@ -52,9 +52,9 @@ struct Snapshot {
   uint16_t pack_voltage_mV;
   uint16_t cell_sum_mV;
   int32_t current_mA;
-  uint16_t full_capacity_cAh;
-  uint16_t design_capacity_cAh;
-  uint16_t remaining_cAh;
+  uint32_t full_capacity_cAh;
+  uint32_t design_capacity_cAh;
+  uint32_t remaining_cAh;
   uint8_t block2_soc_pct;  // the inverter stops discharging when this reaches its 4% floor
   uint16_t block2_word28;  // meaning unknown; 0x0E10 or 0x0610 on my battery
   uint16_t block2_word32;  // meaning unknown; 0 or 4 on my battery
