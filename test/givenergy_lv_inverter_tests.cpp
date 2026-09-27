@@ -60,8 +60,11 @@ class GivEnergyLvInverter : public ::testing::Test {
     datalayer.battery.status.voltage_dV = 520;
     // A normal mid-charge cell voltage, below the taper (see ChargeTaper* tests below): without
     // this, DataLayer's cell_max_voltage_mV default of 3700 mV would taper HR26 to 0 in every
-    // test here that doesn't set the aggregate cell voltages itself.
+    // test here that doesn't set the aggregate cell voltages itself. cell_min_voltage_mV also
+    // defaults to 3700 mV, which is above cell_max here and would leave every test with an
+    // unrealistic inverted pack, so give it a matching normal value too.
     datalayer.aggregate.cell_max_voltage_mV = 3300;
+    datalayer.aggregate.cell_min_voltage_mV = 3280;
   }
 };
 
@@ -283,6 +286,60 @@ TEST_F(GivEnergyLvInverter, FaultStopsChargeAndDischarge) {
   EXPECT_EQ(s.charge_limit_cA, 0);
   EXPECT_EQ(s.discharge_limit_cA, 0);
   EXPECT_EQ(s.limit_cA, 0);
+}
+
+TEST_F(GivEnergyLvInverter, OverVoltageAlarmOnFault) {
+  datalayer.system.status.system_status = FAULT;
+  const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.alarms, 0x000C);
+}
+
+TEST_F(GivEnergyLvInverter, OverVoltageAlarmAtTheCellStop) {
+  datalayer.aggregate.cell_max_voltage_mV = 3599;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0004, 0u);
+  datalayer.aggregate.cell_max_voltage_mV = 3600;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0004, 0x0004u);
+}
+
+TEST_F(GivEnergyLvInverter, OverVoltageAlarmAtTheUserCeiling) {
+  datalayer.battery_settings.user_set_voltage_limits_active = true;
+  datalayer.battery_settings.max_user_set_charge_voltage_dV = 564;
+  datalayer.aggregate.voltage_dV = 563;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0004, 0u);
+  datalayer.aggregate.voltage_dV = 564;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0004, 0x0004u);
+
+  datalayer.battery_settings.user_set_voltage_limits_active = false;
+  datalayer.aggregate.voltage_dV = 570;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0004, 0u);
+}
+
+TEST_F(GivEnergyLvInverter, UnderVoltageAlarmAtTheLowCellStop) {
+  datalayer.aggregate.cell_min_voltage_mV = 2901;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0008, 0u);
+  datalayer.aggregate.cell_min_voltage_mV = 2900;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0008, 0x0008u);
+}
+
+TEST_F(GivEnergyLvInverter, NoAlarmsInNormalRunning) {
+  datalayer.aggregate.cell_max_voltage_mV = 3300;
+  datalayer.aggregate.cell_min_voltage_mV = 3280;
+  datalayer.aggregate.voltage_dV = 530;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+}
+
+TEST_F(GivEnergyLvInverter, FaultAlarmBitsAppearOnTheWire) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.system.status.system_status = FAULT;
+  inverter.update_values();
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(1004);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  EXPECT_EQ(port.tx[3 + 40], 0x00);  // HR20 = 0x000C: over- and under-voltage alarms
+  EXPECT_EQ(port.tx[3 + 41], 0x0C);
 }
 
 TEST_F(GivEnergyLvInverter, StatusBitsFollowTheCurrent) {
