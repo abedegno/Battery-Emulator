@@ -64,6 +64,59 @@ void holding_registers(const Snapshot& s, uint16_t* r) {
   r[27] = s.discharge_limit_cA;
 }
 
+constexpr uint16_t kEmptySlotTemperature = 0xF556;  // -273.0 °C
+
+size_t block1(const Snapshot* s, uint8_t* d) {
+  memset(d, 0, kBlock1Count * 2);
+  for (int i = 0; i < 5; i++) {
+    put16(d + 22 + 2 * i, s ? static_cast<uint16_t>(s->sensor_temps_dC[i]) : kEmptySlotTemperature);
+  }
+  if (s) {
+    put_serial(d, 20, s->serial);
+    put16(d + 32, 0x0001);
+    put16(d + 34, 0x0008);
+  }
+  return kBlock1Count * 2;
+}
+
+size_t block2(const Snapshot* s, uint8_t* d) {
+  memset(d, 0, kBlock2Count * 2);
+  if (s) {
+    const uint32_t current = static_cast<uint32_t>(s->current_mA);
+    d[0] = s->cell_count;
+    put16(d + 1, s->cycles);
+    put16(d + 5, s->pack_voltage_mV);
+    put16(d + 7, s->cell_sum_mV);
+    put16(d + 9, current >> 16);
+    put16(d + 11, current & 0xFFFF);
+    put16(d + 15, s->full_capacity_cAh);
+    put16(d + 19, s->design_capacity_cAh);
+    put16(d + 23, s->remaining_cAh);
+    d[25] = s->block2_soc_pct;
+    put16(d + 28, s->block2_word28);
+    put16(d + 32, s->block2_word32);
+    put16(d + 35, s->firmware);
+  }
+  return kBlock2Count * 2;
+}
+
+size_t block3(const Snapshot* s, uint8_t* d) {
+  memset(d, 0, kBlock3Count * 2);
+  if (s) {
+    for (int i = 0; i < 16; i++) {
+      put16(d + 2 * i, s->cells_mV[i]);
+    }
+    put16(d + 32, static_cast<uint16_t>(s->temp_max_dC));
+    put16(d + 34, static_cast<uint16_t>(s->temp_min_dC));
+    put16(d + 36, s->cell_max_mV);
+    put16(d + 38, s->cell_min_mV);
+  } else {
+    put16(d + 32, kEmptySlotTemperature);
+    put16(d + 34, kEmptySlotTemperature);
+  }
+  return kBlock3Count * 2;
+}
+
 }  // namespace
 
 uint16_t crc16(const uint8_t* data, size_t len) {
@@ -112,6 +165,24 @@ size_t build_reply(const uint8_t* request, const Snapshot& s, uint8_t* out) {
         put16(out + 3 + 2 * i, registers[start + i]);
       }
       return finish(out, 3 + count * 2);
+    }
+    case 4: {
+      // No byte count: GivEnergy echoes the start address instead.
+      out[0] = device;
+      out[1] = function;
+      put16(out + 2, start);
+      const Snapshot* pack = present ? &s : nullptr;
+      size_t len;
+      if (start == kBlock1Start && count == kBlock1Count) {
+        len = block1(pack, out + 4);
+      } else if (start == kBlock2Start && count == kBlock2Count) {
+        len = block2(pack, out + 4);
+      } else if (start == kBlock3Start && count == kBlock3Count) {
+        len = block3(pack, out + 4);
+      } else {
+        return exception(out, device, function, 2);
+      }
+      return finish(out, 4 + len);
     }
     default:
       return 0;
