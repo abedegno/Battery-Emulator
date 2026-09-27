@@ -1,5 +1,6 @@
 #include "GIVENERGY-LV-RS485.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include "../communication/rs485/comm_rs485.h"
@@ -17,6 +18,47 @@ constexpr uint32_t kClockSeed = 0x389D0000;
 // How long len bytes take on the wire at 9600 8N1: 10 bits per byte, rounded up.
 uint32_t tx_ms(size_t len) {
   return static_cast<uint32_t>((len * 10 * 1000 + 9599) / 9600);
+}
+
+constexpr char kSerial[] = "EM2026G001";
+constexpr uint16_t kFirmware = 3020;     // as my battery; 3011 or higher selects HR26/HR27 on a G3
+constexpr uint16_t kLimitCap_cA = 9000;  // 90 A: the new circuit has a 100 A DC MCB
+constexpr uint16_t kCellMin_mV = 2200;   // the inverter's accepted cell range (docs/05)
+constexpr uint16_t kCellMax_mV = 3700;
+constexpr int kCells = 16;
+
+uint16_t clamp_cell(uint16_t mV) {
+  return std::min(std::max(mV, kCellMin_mV), kCellMax_mV);
+}
+
+uint16_t limit_cA(uint16_t dA) {
+  return static_cast<uint16_t>(std::min<uint32_t>(dA * 10u, kLimitCap_cA));
+}
+
+uint16_t saturate16(uint32_t value) {
+  return static_cast<uint16_t>(std::min<uint32_t>(value, 0xFFFF));
+}
+
+// 16 LFP cells at 51.2 V nominal: 0.01 Ah = Wh * 100 / 51.2.
+uint32_t wh_to_cAh(uint32_t wh) {
+  return static_cast<uint32_t>(static_cast<uint64_t>(wh) * 1000 / 512);
+}
+
+// The pack's cell voltages, or, if any is missing, a spread from the
+// aggregate min and max so the inverter still sees plausible cells.
+void fill_cells(givenergy_lv::Snapshot& s) {
+  const uint16_t* cells = datalayer.battery.status.cell_voltages_mV;
+  const bool complete = std::all_of(cells, cells + kCells, [](uint16_t mV) { return mV != 0; });
+  uint32_t sum = 0;
+  for (int i = 0; i < kCells; i++) {
+    uint16_t mV = cells[i];
+    if (!complete) {
+      mV = i == 0 ? s.cell_max_mV : i == 1 ? s.cell_min_mV : (s.cell_max_mV + s.cell_min_mV) / 2;
+    }
+    s.cells_mV[i] = clamp_cell(mV);
+    sum += s.cells_mV[i];
+  }
+  s.cell_sum_mV = saturate16(sum);
 }
 
 }  // namespace
@@ -110,5 +152,49 @@ void GivEnergyLvRs485Inverter::send_reply(uint32_t now_ms) {
 }
 
 givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
-  return givenergy_lv::Snapshot{};  // filled in by Task 6
+  const DATALAYER_AGGREGATE_TYPE& agg = datalayer.aggregate;
+  givenergy_lv::Snapshot s{};
+  std::strcpy(s.serial, kSerial);
+  s.firmware = kFirmware;
+
+  const uint32_t full_cAh = wh_to_cAh(agg.reported_total_capacity_Wh);
+  s.capacity_Ah = saturate16(full_cAh / 100);
+  s.status = 0x00CC;  // bits 2, 3, 6 and 7, always set on my battery in normal running
+  if (agg.current_dA <= 0) {
+    s.status |= 0x01;
+  }
+  if (agg.current_dA != 0) {
+    s.status |= 0x02;
+  }
+  s.soc_pct = agg.reported_soc / 100;
+  s.voltage_cV = agg.voltage_dV * 10;
+  s.current_cA = static_cast<int16_t>(std::min(std::max(agg.current_dA * 10, -32000), 32000));
+  s.temperature_C = agg.temperature_max_dC / 10;
+  s.limit_cA = kLimitCap_cA;
+  if (datalayer.system.status.system_status != FAULT) {
+    s.charge_limit_cA = limit_cA(agg.max_charge_current_dA);
+    s.discharge_limit_cA = limit_cA(agg.max_discharge_current_dA);
+  }
+
+  const int16_t t_max = agg.temperature_max_dC;
+  const int16_t t_min = agg.temperature_min_dC;
+  const int16_t sensors[5] = {t_max, t_min, t_min, t_max, static_cast<int16_t>((t_max + t_min) / 2)};
+  std::copy(sensors, sensors + 5, s.sensor_temps_dC);
+
+  const uint8_t cells = datalayer.battery.info.number_of_cells;
+  s.cell_count = (cells >= 1 && cells <= kCells) ? cells : kCells;
+  s.pack_voltage_mV = saturate16(agg.voltage_dV * 100u);
+  s.current_mA = agg.current_dA * 100;
+  s.full_capacity_cAh = saturate16(full_cAh);
+  s.design_capacity_cAh = s.full_capacity_cAh;
+  s.remaining_cAh = saturate16(wh_to_cAh(agg.reported_remaining_capacity_Wh));
+  s.block2_soc_pct = s.soc_pct;
+  s.block2_word28 = 0x0E10;
+
+  s.cell_max_mV = clamp_cell(agg.cell_max_voltage_mV);
+  s.cell_min_mV = clamp_cell(agg.cell_min_voltage_mV);
+  fill_cells(s);
+  s.temp_max_dC = t_max;
+  s.temp_min_dC = t_min;
+  return s;
 }
