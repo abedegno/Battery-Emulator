@@ -41,9 +41,13 @@ uint16_t saturate16(uint32_t value) {
   return static_cast<uint16_t>(std::min<uint32_t>(value, 0xFFFF));
 }
 
-// 16 LFP cells at 51.2 V nominal: 0.01 Ah = Wh * 100 / 51.2.
-uint32_t wh_to_cAh(uint32_t wh) {
-  return static_cast<uint32_t>(static_cast<uint64_t>(wh) * 1000 / 512);
+// The Growatt battery module computes Wh = Ah x measured pack voltage, so converting back to Ah
+// (and hence cAh) needs that same measured voltage, not a fixed nominal one: cAh = Wh / (V) *
+// 100 = Wh / (voltage_dV / 10) * 100 = Wh * 1000 / voltage_dV. Falls back to 512 (51.2 V nominal,
+// 16 LFP cells) when the aggregate voltage isn't known yet.
+uint32_t wh_to_cAh(uint32_t wh, uint16_t voltage_dV) {
+  const uint16_t dV = voltage_dV != 0 ? voltage_dV : 512;
+  return static_cast<uint32_t>(static_cast<uint64_t>(wh) * 1000 / dV);
 }
 
 // The pack's cell voltages, or, if any is missing, a spread from the
@@ -172,7 +176,7 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   std::strcpy(s.serial, kSerial);
   s.firmware = kFirmware;
 
-  const uint32_t full_cAh = wh_to_cAh(agg.reported_total_capacity_Wh);
+  const uint32_t full_cAh = wh_to_cAh(agg.reported_total_capacity_Wh, agg.voltage_dV);
   s.capacity_Ah = saturate16(full_cAh / 100);
   s.status = 0x00CC;  // bits 2, 3, 6 and 7, always set on my battery in normal running
   if (agg.current_dA <= 0) {
@@ -200,9 +204,9 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   s.cell_count = (cells >= 1 && cells <= kCells) ? cells : kCells;
   s.pack_voltage_mV = saturate16(agg.voltage_dV * 100u);
   s.current_mA = agg.current_dA * 100;
-  s.full_capacity_cAh = saturate16(full_cAh);
+  s.full_capacity_cAh = full_cAh;
   s.design_capacity_cAh = s.full_capacity_cAh;
-  s.remaining_cAh = saturate16(wh_to_cAh(agg.reported_remaining_capacity_Wh));
+  s.remaining_cAh = wh_to_cAh(agg.reported_remaining_capacity_Wh, agg.voltage_dV);
   s.block2_soc_pct = s.soc_pct;
   s.block2_word28 = 0x0E10;
 

@@ -195,3 +195,15 @@ TEST(GivEnergyLvFrames, DevicesOutsideOneToFiveGetNoReply) {
   EXPECT_TRUE(reply_to(with_crc({0x06, 0x04, 0x00, 0x00, 0x00, 0x15}), captured_snapshot()).empty());
   EXPECT_TRUE(reply_to(with_crc({0x06, 0x06, 0x00, 0x02, 0x00, 0x01}), captured_snapshot()).empty());
 }
+
+TEST(GivEnergyLvFrames, Block2CapacityIsSentAsA32BitValue) {
+  // The inverter firmware reads block 2 bytes 13-16 as a u32 BE, 0.01 Ah - big enough that a
+  // 16-bit field would have saturated it.
+  givenergy_lv::Snapshot s = captured_snapshot();
+  s.full_capacity_cAh = 125000;  // 0x0001E848
+  const std::vector<uint8_t> block2 = reply_to(kBlock2Poll, s);
+  EXPECT_EQ(block2[4 + 13], 0x00);
+  EXPECT_EQ(block2[4 + 14], 0x01);
+  EXPECT_EQ(block2[4 + 15], 0xE8);
+  EXPECT_EQ(block2[4 + 16], 0x48);
+}
