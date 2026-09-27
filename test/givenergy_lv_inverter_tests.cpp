@@ -85,6 +85,31 @@ TEST_F(GivEnergyLvInverter, FindsAPollAfterLineNoise) {
   EXPECT_EQ(port.tx.size(), 61u);
 }
 
+TEST_F(GivEnergyLvInverter, StillWithholdsTheReplyThreeMillisecondsIn) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(1003);
+  inverter.receive();
+  EXPECT_TRUE(port.tx.empty()) << "replied inside the 3.5-character turnaround";
+  set_millis64(1004);
+  inverter.receive();
+  EXPECT_EQ(port.tx.size(), 61u);
+}
+
+TEST_F(GivEnergyLvInverter, AssemblesARequestSplitAcrossTwoReceiveCalls) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  port.feed({kHrPoll.begin(), kHrPoll.begin() + 3});
+  inverter.receive();
+  port.feed({kHrPoll.begin() + 3, kHrPoll.end()});
+  inverter.receive();
+  set_millis64(1004);
+  inverter.receive();
+  EXPECT_EQ(port.tx.size(), 61u);
+}
+
 TEST_F(GivEnergyLvInverter, IgnoresItsOwnWriteEchoButAnswersALaterRetry) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
@@ -108,6 +133,24 @@ TEST_F(GivEnergyLvInverter, IgnoresItsOwnWriteEchoButAnswersALaterRetry) {
   set_millis64(1204);
   inverter.receive();
   EXPECT_EQ(port.tx.size(), 16u);
+}
+
+TEST_F(GivEnergyLvInverter, IgnoresAnEchoThatArrivesInTheSameCallAsTheSend) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
+  port.feed(write);
+  inverter.receive();
+
+  set_millis64(1004);
+  port.feed(write);  // the echo is already on the wire before we send our reply this call
+  inverter.receive();
+
+  set_millis64(1010);
+  inverter.receive();
+  set_millis64(1020);
+  inverter.receive();
+  EXPECT_EQ(port.tx.size(), 8u) << "answered its own echo";
 }
 
 TEST_F(GivEnergyLvInverter, DISABLED_ReplyUsesTheDatalayerFromTheLastUpdate) {
