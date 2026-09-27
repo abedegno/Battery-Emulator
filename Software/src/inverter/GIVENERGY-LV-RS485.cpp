@@ -253,10 +253,9 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   // HR20 alarm bits: emulating the DSP firmware showed bit 2 (over-voltage) drops its charge
   // bound to 0 outside a calibration, and to ~180 W during one, lower than the 8 A floor a zero
   // HR26 leaves; bit 3 (under-voltage) cuts discharge to 10%. Neither faults or latches. My real
-  // battery raised bit 2 for 271 s at 57.5 V during a 3 A top-up at 99% SoC - it uses bit 2 as its
-  // over-voltage stop, so this module raises it where HR26 already goes to 0 (the taper's own
-  // stop, or the user's charge-voltage ceiling), and bit 3 at kCellUnderStop_mV, as backups to
-  // HR26/HR27 going to 0.
+  // battery raised bit 2 for 271 s straight after its last top-up to 57.5 V at the top of charge.
+  // This module raises it where HR26 already goes to 0 (the taper's own stop, or the user's
+  // charge-voltage ceiling), and bit 3 at kCellUnderStop_mV, as backups to HR26/HR27 going to 0.
   const bool fault = datalayer.system.status.system_status == FAULT;
   const bool user_ceiling_reached = datalayer.battery_settings.user_set_voltage_limits_active &&
                                     agg.voltage_dV >= datalayer.battery_settings.max_user_set_charge_voltage_dV;
