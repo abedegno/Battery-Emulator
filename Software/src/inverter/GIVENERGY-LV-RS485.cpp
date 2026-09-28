@@ -53,12 +53,19 @@ constexpr uint16_t kAlarmEmpty = 0x0008;
 // reports HR20 bit 3 ("empty"), then charges until it reports bit 2 ("full"). Nothing on the
 // inverter times it out, and it survives a reboot. The requests don't change during one, so the
 // guard infers it from the current against what this module advertised on the previous update:
-//   A: HR26 below 8 A, and the charge more than 2 A over it.
-//   B: HR27 below 8 A, and the discharge more than 2 A over it.
+//   A: HR26 below 8 A, and the charge more than 2 A over max(HR26, 1 A).
+//   B: HR27 below 8 A, and the discharge more than 2 A over max(HR27, 2 A).
 //   C: HR21 at 2% or less (the inverter's own reserve is at least 4%), and a discharge over 5 A.
 //   D: HR20 bit 2 raised, and a charge over 2 A (outside a calibration bit 2 stops it outright).
+// Outside a calibration the DSP's own floors let about 1 A of charge through at HR26 = 0 and 2 A
+// of discharge at HR27 = 0; during one its floor is 8 A or more. So A and B measure from the
+// inverter's floor, not from the advertised limit, and trip only well clear of it.
 constexpr uint16_t kCalibrationFloor_cA = 800;  // the DSP's minimum limit during a calibration
-constexpr int32_t kLimitMargin_cA = 200;        // HR26 = 0 still leaves ~1 A, HR27 = 0 ~2 A
+constexpr int32_t kChargeFloor_cA = 100;        // what HR26 = 0 still lets through
+constexpr int32_t kDischargeFloor_cA = 200;     // what HR27 = 0 still lets through
+constexpr int32_t kLimitMargin_cA = 200;
+// C could also fire if an inverter discharges below its reserve on its own during a grid outage
+// (EPS). At 2% or less the pack is close to its own cut-off anyway, so the risk is low.
 constexpr uint16_t kBelowFloorSoc_pct = 2;
 constexpr int32_t kBelowFloorDischarge_cA = 500;
 constexpr int32_t kAfterFullCharge_cA = 200;             // a calibration still lets ~180 W (3.4 A) through
@@ -74,6 +81,9 @@ constexpr uint32_t kEndingStepMs = 10000;
 // calibration didn't end (or it was something else), and the module locks out.
 constexpr uint32_t kVerifyMs = 60000;
 constexpr uint32_t kVerifyWindowMs = 20000;
+// A trip this soon after a check that passed means the ending didn't take (a calibration stage
+// the battery can't clear, or HR351 set on the inverter): lock out rather than end it again.
+constexpr uint64_t kRepeatWindowMs = 3600000;
 
 uint16_t clamp_cell(uint16_t mV) {
   return std::min(std::max(mV, kCellMin_mV), kCellMax_mV);
@@ -148,12 +158,16 @@ void GivEnergyLvRs485Inverter::update_values() {
   // voltage; datalayer.aggregate keeps a 370 V placeholder meanwhile (see datalayer.h). Once the
   // battery has reported, stay ready even if a later reading is 0 - the FAULT path already zeroes
   // the limits, so there's nothing unsafe left to hide.
+  const bool was_ready = ready_;
   if (datalayer.battery.status.voltage_dV != 0) {
     ready_ = true;
   }
 
-  // snapshot_ still holds what the inverter has been obeying since the last update.
-  update_guard(snapshot_, millis64());
+  // snapshot_ still holds what the inverter has been obeying since the last update. On the update
+  // that makes the module ready, nothing has been sent yet, so there's nothing to check against.
+  if (was_ready) {
+    update_guard(snapshot_, millis64());
+  }
   snapshot_ = snapshot_from_datalayer();
   apply_guard(snapshot_);
 
@@ -239,20 +253,39 @@ void GivEnergyLvRs485Inverter::send_reply(uint32_t now_ms) {
   reply_len_ = 0;
 }
 
+// The battery drivers only write the current when a frame arrives, and nothing zeroes it when the
+// pack goes quiet. A missing pack also puts the emulator into FAULT, which zeroes HR26 and HR27
+// and raises HR20 bits 2 and 3, so a frozen current would look like the inverter ignoring them.
+static bool battery_data_live() {
+  const auto active = [](EVENTS_ENUM_TYPE e) {
+    return get_event_pointer(e)->state != EVENT_STATE_INACTIVE;
+  };
+  return datalayer.battery.status.CAN_battery_still_alive != 0 && !active(EVENT_CAN_BATTERY_MISSING) &&
+         !active(EVENT_CAN_BATTERY2_MISSING) && !active(EVENT_CAN_BATTERY3_MISSING);
+}
+
 void GivEnergyLvRs485Inverter::update_guard(const givenergy_lv::Snapshot& advertised, uint64_t now_ms) {
-  if (!ready_) {
-    return;  // nothing advertised yet, so nothing for the inverter to ignore
-  }
   const uint64_t elapsed_ms = now_ms - guard_since_ms_;
+  const bool live = battery_data_live();
+  if (!live) {
+    std::fill(trigger_active_, trigger_active_ + kTriggers, false);
+  }
   switch (guard_) {
     case Guard::Normal: {
-      const uint8_t trigger = tripped_trigger(advertised, now_ms, false);
-      if (trigger != 0) {
-        logging.printf("GivEnergy: inverter ignored the battery's limits (trigger %c); ending a calibration\n",
-                       'A' + trigger - 1);
-        set_event(EVENT_INVERTER_LIMITS_IGNORED, trigger);
-        enter_guard(Guard::EndingBoth, now_ms);
+      const uint8_t trigger = live ? tripped_trigger(advertised, now_ms, false) : 0;
+      if (trigger == 0) {
+        break;
       }
+      set_event(EVENT_INVERTER_LIMITS_IGNORED, trigger);
+      if (verified_ && now_ms - verified_ms_ < kRepeatWindowMs) {
+        logging.printf("GivEnergy: inverter ignored the battery's limits again (trigger %c); locking out\n",
+                       'A' + trigger - 1);
+        lock_out(trigger, now_ms);
+        break;
+      }
+      logging.printf("GivEnergy: inverter ignored the battery's limits (trigger %c); ending a calibration\n",
+                     'A' + trigger - 1);
+      enter_guard(Guard::EndingBoth, now_ms);
       break;
     }
     case Guard::EndingBoth:
@@ -266,13 +299,11 @@ void GivEnergyLvRs485Inverter::update_guard(const givenergy_lv::Snapshot& advert
       }
       break;
     case Guard::Verify: {
-      const uint8_t trigger = tripped_trigger(advertised, now_ms, true);
+      const uint8_t trigger = live ? tripped_trigger(advertised, now_ms, true) : 0;
       if (trigger != 0) {
         logging.printf("GivEnergy: inverter still ignores the battery's limits (trigger %c); locking out\n",
                        'A' + trigger - 1);
-        set_event_latched(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT, trigger);
-        reply_len_ = 0;  // not even a reply already queued
-        enter_guard(Guard::Lockout, now_ms);
+        lock_out(trigger, now_ms);
         break;
       }
       // A condition that started late in the check gets its full window before the all-clear.
@@ -280,13 +311,27 @@ void GivEnergyLvRs485Inverter::update_guard(const givenergy_lv::Snapshot& advert
       if (elapsed_ms >= kVerifyMs && !counting) {
         logging.println("GivEnergy: the inverter obeys the battery's limits again");
         clear_event(EVENT_INVERTER_LIMITS_IGNORED);
+        verified_ = true;
+        verified_ms_ = now_ms;
         enter_guard(Guard::Normal, now_ms);
       }
       break;
     }
     case Guard::Lockout:
-      break;  // latched until the ESP32 restarts
+      // Latched until the ESP32 restarts. "Clear events" on the web page mustn't hide it while the
+      // module stays silent, so raise it again (only when cleared, so occurences stays put).
+      if (get_event_pointer(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT)->state == EVENT_STATE_INACTIVE) {
+        set_event_latched(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT, lockout_trigger_);
+      }
+      break;
   }
+}
+
+void GivEnergyLvRs485Inverter::lock_out(uint8_t trigger, uint64_t now_ms) {
+  lockout_trigger_ = trigger;
+  set_event_latched(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT, trigger);
+  reply_len_ = 0;  // not even a reply already queued
+  enter_guard(Guard::Lockout, now_ms);
 }
 
 uint8_t GivEnergyLvRs485Inverter::tripped_trigger(const givenergy_lv::Snapshot& advertised, uint64_t now_ms,
@@ -296,9 +341,10 @@ uint8_t GivEnergyLvRs485Inverter::tripped_trigger(const givenergy_lv::Snapshot& 
   const int32_t charge_cA = std::max<int32_t>(current_cA, 0);
   const int32_t discharge_cA = std::max<int32_t>(-current_cA, 0);
   const bool holds[kTriggers] = {
-      advertised.charge_limit_cA < kCalibrationFloor_cA && charge_cA > advertised.charge_limit_cA + kLimitMargin_cA,
+      advertised.charge_limit_cA < kCalibrationFloor_cA &&
+          charge_cA > std::max<int32_t>(advertised.charge_limit_cA, kChargeFloor_cA) + kLimitMargin_cA,
       advertised.discharge_limit_cA < kCalibrationFloor_cA &&
-          discharge_cA > advertised.discharge_limit_cA + kLimitMargin_cA,
+          discharge_cA > std::max<int32_t>(advertised.discharge_limit_cA, kDischargeFloor_cA) + kLimitMargin_cA,
       advertised.soc_pct <= kBelowFloorSoc_pct && discharge_cA > kBelowFloorDischarge_cA,
       (advertised.alarms & kAlarmFull) != 0 && charge_cA > kAfterFullCharge_cA,
   };
