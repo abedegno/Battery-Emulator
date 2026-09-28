@@ -44,6 +44,37 @@ constexpr uint16_t kCellStop_mV = 3600;       // charging stops here: belt and b
 constexpr uint16_t kCellUnderStop_mV = 2900;  // LFP low-cell stop: backup to the battery's own
                                               // discharge limit already going to 0
 
+// HR20 alarm bits that the inverter reads as "full" (bit 2) and "empty" (bit 3).
+constexpr uint16_t kAlarmFull = 0x0004;
+constexpr uint16_t kAlarmEmpty = 0x0008;
+
+// Calibration guard. During a battery calibration the inverter's DSP holds both current limits at
+// 8 A or more, whatever HR26 and HR27 say, and discharges past any reserve until the battery
+// reports HR20 bit 3 ("empty"), then charges until it reports bit 2 ("full"). Nothing on the
+// inverter times it out, and it survives a reboot. The requests don't change during one, so the
+// guard infers it from the current against what this module advertised on the previous update:
+//   A: HR26 below 8 A, and the charge more than 2 A over it.
+//   B: HR27 below 8 A, and the discharge more than 2 A over it.
+//   C: HR21 at 2% or less (the inverter's own reserve is at least 4%), and a discharge over 5 A.
+//   D: HR20 bit 2 raised, and a charge over 2 A (outside a calibration bit 2 stops it outright).
+constexpr uint16_t kCalibrationFloor_cA = 800;  // the DSP's minimum limit during a calibration
+constexpr int32_t kLimitMargin_cA = 200;        // HR26 = 0 still leaves ~1 A, HR27 = 0 ~2 A
+constexpr uint16_t kBelowFloorSoc_pct = 2;
+constexpr int32_t kBelowFloorDischarge_cA = 500;
+constexpr int32_t kAfterFullCharge_cA = 200;             // a calibration still lets ~180 W (3.4 A) through
+constexpr uint32_t kChargeOverLimitWindowMs = 60000;     // A
+constexpr uint32_t kDischargeOverLimitWindowMs = 60000;  // B
+constexpr uint32_t kBelowFloorWindowMs = 60000;          // C
+constexpr uint32_t kAfterFullWindowMs = 30000;           // D
+// Ending a calibration: bits 2 and 3 together record "empty", then bit 2 alone records "full"
+// (the inverter tests bit 3 first, so both at once never gets to "full"). The inverter moves the
+// stage on the first DSP frame that carries a bit, a few per second; 10 s each leaves a margin.
+constexpr uint32_t kEndingStepMs = 10000;
+// Then normal values, watching A to D again with a shorter window. Anything tripping means the
+// calibration didn't end (or it was something else), and the module locks out.
+constexpr uint32_t kVerifyMs = 60000;
+constexpr uint32_t kVerifyWindowMs = 20000;
+
 uint16_t clamp_cell(uint16_t mV) {
   return std::min(std::max(mV, kCellMin_mV), kCellMax_mV);
 }
@@ -113,8 +144,6 @@ bool GivEnergyLvRs485Inverter::setup() {
 }
 
 void GivEnergyLvRs485Inverter::update_values() {
-  snapshot_ = snapshot_from_datalayer();
-
   // datalayer.battery.status.voltage_dV is 0 until the battery module has decoded a real pack
   // voltage; datalayer.aggregate keeps a 370 V placeholder meanwhile (see datalayer.h). Once the
   // battery has reported, stay ready even if a later reading is 0 - the FAULT path already zeroes
@@ -122,6 +151,11 @@ void GivEnergyLvRs485Inverter::update_values() {
   if (datalayer.battery.status.voltage_dV != 0) {
     ready_ = true;
   }
+
+  // snapshot_ still holds what the inverter has been obeying since the last update.
+  update_guard(snapshot_, millis64());
+  snapshot_ = snapshot_from_datalayer();
+  apply_guard(snapshot_);
 
   if (incoming_message_counter_ > 0) {
     incoming_message_counter_--;
@@ -186,6 +220,9 @@ void GivEnergyLvRs485Inverter::handle_request(uint32_t now_ms) {
   if (!ready_) {
     return;  // no real snapshot yet: stay silent rather than answer with placeholder values
   }
+  if (guard_ == Guard::Lockout) {
+    return;  // silent for good: after ~30 s the inverter declares the battery lost
+  }
   snapshot_.clock_hash = kClockSeed + now_ms / 1000;
   reply_len_ = givenergy_lv::build_reply(rx_, snapshot_, reply_);
   request_ms_ = now_ms;
@@ -200,6 +237,121 @@ void GivEnergyLvRs485Inverter::send_reply(uint32_t now_ms) {
   const uint32_t sent_end_ms = now_ms + tx_ms(reply_len_);
   echo_until_ms_ = sent_end_ms + kEchoWindowMs;
   reply_len_ = 0;
+}
+
+void GivEnergyLvRs485Inverter::update_guard(const givenergy_lv::Snapshot& advertised, uint64_t now_ms) {
+  if (!ready_) {
+    return;  // nothing advertised yet, so nothing for the inverter to ignore
+  }
+  const uint64_t elapsed_ms = now_ms - guard_since_ms_;
+  switch (guard_) {
+    case Guard::Normal: {
+      const uint8_t trigger = tripped_trigger(advertised, now_ms, false);
+      if (trigger != 0) {
+        logging.printf("GivEnergy: inverter ignored the battery's limits (trigger %c); ending a calibration\n",
+                       'A' + trigger - 1);
+        set_event(EVENT_INVERTER_LIMITS_IGNORED, trigger);
+        enter_guard(Guard::EndingBoth, now_ms);
+      }
+      break;
+    }
+    case Guard::EndingBoth:
+      if (elapsed_ms >= kEndingStepMs) {
+        enter_guard(Guard::EndingFull, now_ms);
+      }
+      break;
+    case Guard::EndingFull:
+      if (elapsed_ms >= kEndingStepMs) {
+        enter_guard(Guard::Verify, now_ms);
+      }
+      break;
+    case Guard::Verify: {
+      const uint8_t trigger = tripped_trigger(advertised, now_ms, true);
+      if (trigger != 0) {
+        logging.printf("GivEnergy: inverter still ignores the battery's limits (trigger %c); locking out\n",
+                       'A' + trigger - 1);
+        set_event_latched(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT, trigger);
+        reply_len_ = 0;  // not even a reply already queued
+        enter_guard(Guard::Lockout, now_ms);
+        break;
+      }
+      // A condition that started late in the check gets its full window before the all-clear.
+      const bool counting = std::any_of(trigger_active_, trigger_active_ + kTriggers, [](bool b) { return b; });
+      if (elapsed_ms >= kVerifyMs && !counting) {
+        logging.println("GivEnergy: the inverter obeys the battery's limits again");
+        clear_event(EVENT_INVERTER_LIMITS_IGNORED);
+        enter_guard(Guard::Normal, now_ms);
+      }
+      break;
+    }
+    case Guard::Lockout:
+      break;  // latched until the ESP32 restarts
+  }
+}
+
+uint8_t GivEnergyLvRs485Inverter::tripped_trigger(const givenergy_lv::Snapshot& advertised, uint64_t now_ms,
+                                                  bool verifying) {
+  // The aggregate current, as HR23 reports it: the sum of every pack, positive = charging.
+  const int32_t current_cA = datalayer.aggregate.current_dA * 10;
+  const int32_t charge_cA = std::max<int32_t>(current_cA, 0);
+  const int32_t discharge_cA = std::max<int32_t>(-current_cA, 0);
+  const bool holds[kTriggers] = {
+      advertised.charge_limit_cA < kCalibrationFloor_cA && charge_cA > advertised.charge_limit_cA + kLimitMargin_cA,
+      advertised.discharge_limit_cA < kCalibrationFloor_cA &&
+          discharge_cA > advertised.discharge_limit_cA + kLimitMargin_cA,
+      advertised.soc_pct <= kBelowFloorSoc_pct && discharge_cA > kBelowFloorDischarge_cA,
+      (advertised.alarms & kAlarmFull) != 0 && charge_cA > kAfterFullCharge_cA,
+  };
+  const uint32_t windows_ms[kTriggers] = {kChargeOverLimitWindowMs, kDischargeOverLimitWindowMs, kBelowFloorWindowMs,
+                                          kAfterFullWindowMs};
+  uint8_t tripped = 0;
+  for (int i = 0; i < kTriggers; i++) {
+    if (!holds[i]) {
+      trigger_active_[i] = false;
+      continue;
+    }
+    if (!trigger_active_[i]) {
+      trigger_active_[i] = true;
+      trigger_since_ms_[i] = now_ms;
+    }
+    const uint32_t window_ms = verifying ? kVerifyWindowMs : windows_ms[i];
+    if (tripped == 0 && now_ms - trigger_since_ms_[i] >= window_ms) {
+      tripped = static_cast<uint8_t>(i + 1);
+    }
+  }
+  return tripped;
+}
+
+void GivEnergyLvRs485Inverter::enter_guard(Guard state, uint64_t now_ms) {
+  guard_ = state;
+  guard_since_ms_ = now_ms;
+  std::fill(trigger_active_, trigger_active_ + kTriggers, false);
+}
+
+void GivEnergyLvRs485Inverter::apply_guard(givenergy_lv::Snapshot& s) const {
+  switch (guard_) {
+    case Guard::EndingBoth:
+      s.charge_limit_cA = 0;
+      s.discharge_limit_cA = 0;
+      s.alarms |= kAlarmFull | kAlarmEmpty;
+      break;
+    case Guard::EndingFull:
+      s.charge_limit_cA = 0;
+      s.discharge_limit_cA = 0;
+      s.alarms = (s.alarms & ~kAlarmEmpty) | kAlarmFull;
+      break;
+    case Guard::Lockout:
+      // Nothing goes out any more, but the ERROR event's FAULT does this anyway, except while a
+      // user-forced recovery charge holds the emulator ACTIVE.
+      s.limit_cA = 0;
+      s.charge_limit_cA = 0;
+      s.discharge_limit_cA = 0;
+      s.alarms |= kAlarmFull | kAlarmEmpty;
+      break;
+    case Guard::Normal:
+    case Guard::Verify:
+      break;
+  }
 }
 
 givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {

@@ -18,11 +18,20 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   // Wire values for the current datalayer. Public for the unit tests.
   static givenergy_lv::Snapshot snapshot_from_datalayer();
 
+  // What the calibration guard is doing. Public for the unit tests.
+  enum class Guard : uint8_t { Normal, EndingBoth, EndingFull, Verify, Lockout };
+  Guard guard() const { return guard_; }
+  const givenergy_lv::Snapshot& snapshot() const { return snapshot_; }
+
  private:
   int baud_rate() override { return 9600; }
   bool is_echo(uint32_t now_ms) const;
   void handle_request(uint32_t now_ms);
   void send_reply(uint32_t now_ms);
+  void update_guard(const givenergy_lv::Snapshot& advertised, uint64_t now_ms);
+  uint8_t tripped_trigger(const givenergy_lv::Snapshot& advertised, uint64_t now_ms, bool verifying);
+  void enter_guard(Guard state, uint64_t now_ms);
+  void apply_guard(givenergy_lv::Snapshot& s) const;
 
   // Modbus RTU wants 3.5 character times (3.6 ms at 9600) before a reply.
   static constexpr uint32_t kTurnaroundMs = 4;
@@ -49,6 +58,13 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   // receive() parses and discards requests without replying, so we never tell the inverter a
   // DataLayer default (370 V) is the pack voltage. Sticky: once true, stays true.
   bool ready_ = false;
+  // The calibration guard (see update_guard()). Triggers A to D each remember when their
+  // condition started, and whether it still holds.
+  static constexpr int kTriggers = 4;
+  Guard guard_ = Guard::Normal;
+  uint64_t guard_since_ms_ = 0;
+  uint64_t trigger_since_ms_[kTriggers] = {};
+  bool trigger_active_[kTriggers] = {};
 };
 
 #endif
