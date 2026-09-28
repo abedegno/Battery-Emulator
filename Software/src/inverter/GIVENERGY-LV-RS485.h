@@ -31,6 +31,7 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   void update_guard(const givenergy_lv::Snapshot& advertised, uint64_t now_ms);
   uint8_t tripped_trigger(const givenergy_lv::Snapshot& advertised, uint64_t now_ms, bool verifying);
   void enter_guard(Guard state, uint64_t now_ms);
+  void lock_out(uint8_t trigger, uint64_t now_ms);
   void apply_guard(givenergy_lv::Snapshot& s) const;
 
   // Modbus RTU wants 3.5 character times (3.6 ms at 9600) before a reply.
@@ -65,6 +66,9 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   uint64_t guard_since_ms_ = 0;
   uint64_t trigger_since_ms_[kTriggers] = {};
   bool trigger_active_[kTriggers] = {};
+  bool verified_ = false;  // a check has passed; verified_ms_ is when the last one did
+  uint64_t verified_ms_ = 0;
+  uint8_t lockout_trigger_ = 0;
 };
 
 #endif
