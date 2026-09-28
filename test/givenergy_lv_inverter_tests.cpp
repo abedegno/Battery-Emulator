@@ -457,3 +457,394 @@ TEST(GivEnergyLvEvents, TheLockoutPutsTheEmulatorIntoFault) {
   EXPECT_EQ(datalayer.system.status.system_status, FAULT);
   reset_all_events();
 }
+
+// ---- Calibration guard ----
+//
+// During a GivEnergy battery calibration the inverter holds both current limits at 8 A or more,
+// whatever HR26 and HR27 say. The guard spots that from the current, ends the calibration by
+// reporting HR20 "empty" then "full", and stops answering if the inverter still won't obey.
+
+namespace {
+
+using Guard = GivEnergyLvRs485Inverter::Guard;
+
+class GivEnergyLvGuard : public GivEnergyLvInverter {
+ protected:
+  void SetUp() override {
+    GivEnergyLvInverter::SetUp();
+    init_events();
+    reset_all_events();
+    datalayer.aggregate.voltage_dV = 520;
+    datalayer.aggregate.reported_soc = 5000;
+    datalayer.aggregate.max_charge_current_dA = 800;  // 80 A
+    datalayer.aggregate.max_discharge_current_dA = 800;
+  }
+  void TearDown() override { reset_all_events(); }
+
+  // One core_loop second at a time: the inverter polls (and gets its reply, if any) near the
+  // end of the second, then update_values() runs. The polls keep EVENT_MODBUS_INVERTER_MISSING,
+  // an ERROR, from putting the emulator into FAULT.
+  static void run(GivEnergyLvRs485Inverter& inverter, FakeSerial& port, int seconds) {
+    for (int i = 0; i < seconds; i++) {
+      const uint64_t start = millis64();
+      set_millis64(start + 990);
+      port.feed(kHrPoll);
+      inverter.receive();
+      set_millis64(start + 1000);
+      inverter.receive();
+      inverter.update_values();
+    }
+  }
+
+  static const EVENTS_STRUCT_TYPE& event(EVENTS_ENUM_TYPE e) { return *get_event_pointer(e); }
+
+  // Trips trigger A (5 A advertised, 8 A flowing) and returns once the guard has.
+  static void trip(GivEnergyLvRs485Inverter& inverter, FakeSerial& port) {
+    datalayer.aggregate.max_charge_current_dA = 50;
+    datalayer.aggregate.current_dA = 80;
+    run(inverter, port, 1);   // HR26 goes to 5 A; the inverter has obeyed the old 80 A until now
+    run(inverter, port, 61);  // the condition holds from the first of these to the last
+    ASSERT_EQ(inverter.guard(), Guard::EndingBoth);
+  }
+};
+
+}  // namespace
+
+TEST_F(GivEnergyLvGuard, TripsWhenChargeIgnoresALowHr26) {
+  FakeSerial port;
+  datalayer.aggregate.max_charge_current_dA = 50;  // HR26 = 5 A
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 71;  // 7.1 A: more than 2 A over
+  inverter.update_values();             // the condition starts here
+  run(inverter, port, 59);
+  EXPECT_EQ(inverter.guard(), Guard::Normal) << "tripped a second early";
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).state, EVENT_STATE_INACTIVE);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).state, EVENT_STATE_ACTIVE);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).data, 1);  // trigger A
+}
+
+TEST_F(GivEnergyLvGuard, AChargeDipRestartsTheWindow) {
+  FakeSerial port;
+  datalayer.aggregate.max_charge_current_dA = 50;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 80;
+  inverter.update_values();
+  run(inverter, port, 40);
+  datalayer.aggregate.current_dA = 70;  // exactly 2 A over: not more than 2 A
+  run(inverter, port, 1);
+  datalayer.aggregate.current_dA = 80;
+  run(inverter, port, 60);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+}
+
+TEST_F(GivEnergyLvGuard, TripsWhenDischargeIgnoresALowHr27) {
+  FakeSerial port;
+  datalayer.aggregate.max_discharge_current_dA = 0;  // HR27 = 0
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = -80;  // 8 A discharge: the calibration's 8 A floor
+  inverter.update_values();
+  run(inverter, port, 59);
+  EXPECT_EQ(inverter.guard(), Guard::Normal) << "tripped a second early";
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).data, 2);  // trigger B
+}
+
+TEST_F(GivEnergyLvGuard, ADischargeDipRestartsTheWindow) {
+  FakeSerial port;
+  datalayer.aggregate.max_discharge_current_dA = 0;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = -80;
+  inverter.update_values();
+  run(inverter, port, 30);
+  datalayer.aggregate.current_dA = -20;  // the inverter's own 2 A floor at HR27 = 0
+  run(inverter, port, 1);
+  datalayer.aggregate.current_dA = -80;
+  run(inverter, port, 60);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+}
+
+TEST_F(GivEnergyLvGuard, TripsWhenDischargeCarriesOnBelowTheFloor) {
+  FakeSerial port;
+  datalayer.aggregate.reported_soc = 200;  // 2%: below any reserve the inverter allows
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = -51;  // 5.1 A discharge, well inside HR27 = 80 A
+  inverter.update_values();
+  run(inverter, port, 59);
+  EXPECT_EQ(inverter.guard(), Guard::Normal) << "tripped a second early";
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).data, 3);  // trigger C
+}
+
+TEST_F(GivEnergyLvGuard, AFloorDipRestartsTheWindow) {
+  FakeSerial port;
+  datalayer.aggregate.reported_soc = 100;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = -300;
+  inverter.update_values();
+  run(inverter, port, 50);
+  datalayer.aggregate.current_dA = -50;  // 5 A: not over 5 A
+  run(inverter, port, 1);
+  datalayer.aggregate.current_dA = -300;
+  run(inverter, port, 60);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+}
+
+TEST_F(GivEnergyLvGuard, TheFloorTriggerNeedsTwoPercentOrLess) {
+  FakeSerial port;
+  datalayer.aggregate.reported_soc = 300;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = -300;
+  inverter.update_values();
+  run(inverter, port, 600);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
+
+TEST_F(GivEnergyLvGuard, TripsWhenChargeCarriesOnAfterFull) {
+  FakeSerial port;
+  // The user's charge-voltage ceiling raises HR20 bit 2 without touching HR26, so only
+  // trigger D can see this one.
+  datalayer.battery_settings.user_set_voltage_limits_active = true;
+  datalayer.battery_settings.max_user_set_charge_voltage_dV = 540;
+  datalayer.aggregate.voltage_dV = 540;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 21;  // 2.1 A: about the 180 W a calibration lets through
+  inverter.update_values();
+  run(inverter, port, 29);
+  EXPECT_EQ(inverter.guard(), Guard::Normal) << "tripped a second early";
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).data, 4);  // trigger D
+}
+
+TEST_F(GivEnergyLvGuard, AnAfterFullDipRestartsTheWindow) {
+  FakeSerial port;
+  datalayer.battery_settings.user_set_voltage_limits_active = true;
+  datalayer.battery_settings.max_user_set_charge_voltage_dV = 540;
+  datalayer.aggregate.voltage_dV = 540;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 35;
+  inverter.update_values();
+  run(inverter, port, 20);
+  datalayer.aggregate.current_dA = 20;  // 2 A: not over 2 A
+  run(inverter, port, 1);
+  datalayer.aggregate.current_dA = 35;
+  run(inverter, port, 30);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+}
+
+TEST_F(GivEnergyLvGuard, CountsOnlyOnceTheBatteryHasReported) {
+  FakeSerial port;
+  datalayer.battery.status.voltage_dV = 0;
+  datalayer.aggregate.max_charge_current_dA = 50;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 80;
+  inverter.update_values();
+  run(inverter, port, 120);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+  datalayer.battery.status.voltage_dV = 520;
+  run(inverter, port, 60);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+}
+
+TEST_F(GivEnergyLvGuard, EndsTheCalibrationWithEmptyThenFull) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  datalayer.aggregate.current_dA = 0;  // the inverter backs off
+  for (int s = 0; s < 10; s++) {
+    SCOPED_TRACE(s);
+    EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
+    EXPECT_EQ(inverter.snapshot().alarms, 0x000C);
+    EXPECT_EQ(inverter.snapshot().charge_limit_cA, 0);
+    EXPECT_EQ(inverter.snapshot().discharge_limit_cA, 0);
+    run(inverter, port, 1);
+  }
+  for (int s = 10; s < 20; s++) {
+    SCOPED_TRACE(s);
+    EXPECT_EQ(inverter.guard(), Guard::EndingFull);
+    EXPECT_EQ(inverter.snapshot().alarms, 0x0004);
+    EXPECT_EQ(inverter.snapshot().charge_limit_cA, 0);
+    EXPECT_EQ(inverter.snapshot().discharge_limit_cA, 0);
+    run(inverter, port, 1);
+  }
+  EXPECT_EQ(inverter.guard(), Guard::Verify);
+  EXPECT_EQ(inverter.snapshot().alarms, 0u);
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 500);
+  EXPECT_EQ(inverter.snapshot().discharge_limit_cA, 8000);
+}
+
+TEST_F(GivEnergyLvGuard, TheEndingBitsGoOutOnTheWire) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  port.tx.clear();
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(millis64() + 4);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  EXPECT_EQ(port.tx[3 + 40], 0x00);  // HR20 = 0x000C: empty and full
+  EXPECT_EQ(port.tx[3 + 41], 0x0C);
+  EXPECT_EQ(port.tx[3 + 52], 0x00);  // HR26 = 0
+  EXPECT_EQ(port.tx[3 + 53], 0x00);
+  EXPECT_EQ(port.tx[3 + 54], 0x00);  // HR27 = 0
+  EXPECT_EQ(port.tx[3 + 55], 0x00);
+
+  run(inverter, port, 10);
+  port.tx.clear();
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(millis64() + 4);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  EXPECT_EQ(port.tx[3 + 41], 0x04);  // HR20 = 0x0004: full alone
+}
+
+TEST_F(GivEnergyLvGuard, GoesBackToNormalWhenTheInverterObeys) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  datalayer.aggregate.current_dA = 0;
+  run(inverter, port, 20);
+  ASSERT_EQ(inverter.guard(), Guard::Verify);
+  datalayer.aggregate.current_dA = 60;  // 6 A under HR26 = 5 A: within the 2 A margin
+  run(inverter, port, 59);
+  EXPECT_EQ(inverter.guard(), Guard::Verify);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).state, EVENT_STATE_ACTIVE);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).state, EVENT_STATE_INACTIVE);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT).state, EVENT_STATE_INACTIVE);
+  EXPECT_EQ(datalayer.system.status.system_status, ACTIVE);
+}
+
+TEST_F(GivEnergyLvGuard, LocksOutWhenTheInverterKeepsOverriding) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  run(inverter, port, 20);  // the current stays at 8 A against HR26 = 5 A throughout
+  ASSERT_EQ(inverter.guard(), Guard::Verify);
+  run(inverter, port, 20);
+  EXPECT_EQ(inverter.guard(), Guard::Verify) << "locked out a second early";
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::Lockout);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT).state, EVENT_STATE_ACTIVE_LATCHED);
+  EXPECT_EQ(datalayer.system.status.system_status, FAULT);
+
+  port.tx.clear();
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(millis64() + 4);
+  inverter.receive();
+  EXPECT_TRUE(port.tx.empty()) << "answered the inverter while locked out";
+  EXPECT_TRUE(port.rx.empty()) << "left the poll in the receive buffer";
+
+  datalayer.aggregate.current_dA = 0;  // the inverter gives up on the battery, but keeps polling
+  run(inverter, port, 3600);
+  EXPECT_EQ(inverter.guard(), Guard::Lockout);
+  EXPECT_TRUE(port.tx.empty()) << "the lockout didn't latch";
+}
+
+TEST_F(GivEnergyLvGuard, LockoutStopsAReplyAlreadyQueued) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  run(inverter, port, 40);
+  ASSERT_EQ(inverter.guard(), Guard::Verify);
+  port.tx.clear();
+  set_millis64(millis64() + 999);
+  port.feed(kHrPoll);
+  inverter.receive();  // queued, to go out after the turnaround
+  set_millis64(millis64() + 1);
+  inverter.update_values();
+  ASSERT_EQ(inverter.guard(), Guard::Lockout);
+  set_millis64(millis64() + 10);
+  inverter.receive();
+  EXPECT_TRUE(port.tx.empty()) << "sent a reply queued before the lockout";
+}
+
+TEST_F(GivEnergyLvGuard, NoTripOnTheTrickleCharge) {
+  FakeSerial port;
+  datalayer.aggregate.cell_max_voltage_mV = 3560;  // taper at 3 A
+  GivEnergyLvRs485Inverter inverter(port);
+  ASSERT_EQ(inverter.snapshot().charge_limit_cA, 300);
+  datalayer.aggregate.current_dA = 30;
+  inverter.update_values();
+  run(inverter, port, 600);
+  datalayer.aggregate.current_dA = 50;  // 5 A: still within the 2 A margin
+  run(inverter, port, 600);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
+
+TEST_F(GivEnergyLvGuard, NoTripAtTheCeilingWhileTheChargeDecays) {
+  FakeSerial port;
+  datalayer.aggregate.cell_max_voltage_mV = 3600;  // HR26 = 0 and HR20 bit 2
+  GivEnergyLvRs485Inverter inverter(port);
+  ASSERT_EQ(inverter.snapshot().charge_limit_cA, 0);
+  ASSERT_EQ(inverter.snapshot().alarms & 0x0004, 0x0004);
+  for (int s = 0; s <= 20; s++) {
+    datalayer.aggregate.current_dA = static_cast<int16_t>(300 - 15 * s);  // 30 A down to 0 in 20 s
+    run(inverter, port, 1);
+  }
+  run(inverter, port, 600);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
+
+TEST_F(GivEnergyLvGuard, NoTripOnADischargeStoppedAtTheReserve) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.reported_soc = 500;
+  datalayer.aggregate.current_dA = -200;
+  run(inverter, port, 600);
+  datalayer.aggregate.reported_soc = 400;
+  run(inverter, port, 5);
+  datalayer.aggregate.current_dA = 0;
+  run(inverter, port, 600);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
+
+TEST_F(GivEnergyLvGuard, NoTripOnAHeavyDischargeWithinHr27) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = -700;
+  run(inverter, port, 3600);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
+
+TEST_F(GivEnergyLvGuard, NoTripOnDischargeWhileReportingFull) {
+  FakeSerial port;
+  datalayer.aggregate.cell_max_voltage_mV = 3600;  // HR20 bit 2, as my real battery sent it
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = -200;
+  run(inverter, port, 600);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
+
+TEST_F(GivEnergyLvGuard, AnOverrideLateInTheCheckStillGetsItsWindow) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  datalayer.aggregate.current_dA = 0;
+  run(inverter, port, 20);
+  ASSERT_EQ(inverter.guard(), Guard::Verify);
+  run(inverter, port, 50);
+  datalayer.aggregate.current_dA = 80;  // back over HR26 = 5 A from 51 s into the check
+  run(inverter, port, 20);
+  EXPECT_EQ(inverter.guard(), Guard::Verify) << "gave the all-clear with a condition still counting";
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::Lockout);
+}
