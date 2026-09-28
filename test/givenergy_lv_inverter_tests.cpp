@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <deque>
 #include <vector>
 
 #include "../Software/src/datalayer/datalayer.h"
+#include "../Software/src/devboard/utils/events.h"
 #include "../Software/src/devboard/utils/types.h"
 #include "../Software/src/inverter/GIVENERGY-LV-FRAMES.h"
 #include "../Software/src/inverter/GIVENERGY-LV-RS485.h"
@@ -436,4 +438,22 @@ TEST_F(GivEnergyLvInverter, NoBatteryYetStillGivesInRangeValues) {
   EXPECT_EQ(s.charge_limit_cA, 0);
   EXPECT_EQ(s.discharge_limit_cA, 0);
   EXPECT_EQ(s.cell_count, 16);
+}
+
+TEST(GivEnergyLvEvents, LimitsIgnoredIsAWarningAndItsLockoutAnError) {
+  init_events();
+  reset_all_events();
+  EXPECT_STREQ(get_event_level_string(EVENT_INVERTER_LIMITS_IGNORED), "WARNING");
+  EXPECT_STREQ(get_event_level_string(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT), "ERROR");
+  EXPECT_NE(strstr(get_event_message_string(EVENT_INVERTER_LIMITS_IGNORED).c_str(), "calibration"), nullptr);
+  EXPECT_NE(strstr(get_event_message_string(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT).c_str(), "HR29"), nullptr);
+}
+
+TEST(GivEnergyLvEvents, TheLockoutPutsTheEmulatorIntoFault) {
+  datalayer = DataLayer();
+  init_events();
+  reset_all_events();
+  set_event_latched(EVENT_INVERTER_LIMITS_IGNORED_LOCKOUT, 0);
+  EXPECT_EQ(datalayer.system.status.system_status, FAULT);
+  reset_all_events();
 }
