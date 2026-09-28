@@ -256,6 +256,8 @@ void GivEnergyLvRs485Inverter::send_reply(uint32_t now_ms) {
 // The battery drivers only write the current when a frame arrives, and nothing zeroes it when the
 // pack goes quiet. A missing pack also puts the emulator into FAULT, which zeroes HR26 and HR27
 // and raises HR20 bits 2 and 3, so a frozen current would look like the inverter ignoring them.
+// A configured pack 2 or 3 that never shows up keeps its MISSING warning raised, which holds the
+// guard off for as long as it lasts. That can't happen with the single pack this module drives.
 static bool battery_data_live() {
   const auto active = [](EVENTS_ENUM_TYPE e) {
     return get_event_pointer(e)->state != EVENT_STATE_INACTIVE;
@@ -299,7 +301,13 @@ void GivEnergyLvRs485Inverter::update_guard(const givenergy_lv::Snapshot& advert
       }
       break;
     case Guard::Verify: {
-      const uint8_t trigger = live ? tripped_trigger(advertised, now_ms, true) : 0;
+      if (!live) {
+        // Nothing can be measured: hold the check open, and give it a full 60 s of live data
+        // from when the battery comes back.
+        guard_since_ms_ = now_ms;
+        break;
+      }
+      const uint8_t trigger = tripped_trigger(advertised, now_ms, true);
       if (trigger != 0) {
         logging.printf("GivEnergy: inverter still ignores the battery's limits (trigger %c); locking out\n",
                        'A' + trigger - 1);

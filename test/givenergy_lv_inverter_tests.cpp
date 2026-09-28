@@ -1006,3 +1006,39 @@ TEST_F(GivEnergyLvGuard, LockoutZeroesTheLimitsEvenWithoutFault) {
   EXPECT_EQ(inverter.snapshot().discharge_limit_cA, 0);
   EXPECT_EQ(inverter.snapshot().alarms, 0x000C);
 }
+
+TEST_F(GivEnergyLvGuard, VerifyWaitsForLiveBatteryData) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  run(inverter, port, 20);  // the current stays at 8 A against HR26 = 5 A throughout
+  ASSERT_EQ(inverter.guard(), Guard::Verify);
+  datalayer.battery.status.CAN_battery_still_alive = 0;
+  set_event(EVENT_CAN_BATTERY_MISSING, 0);
+  run(inverter, port, 90);
+  EXPECT_EQ(inverter.guard(), Guard::Verify) << "gave the all-clear with nothing measured";
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).state, EVENT_STATE_ACTIVE);
+
+  datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+  clear_event(EVENT_CAN_BATTERY_MISSING);
+  run(inverter, port, 20);
+  EXPECT_EQ(inverter.guard(), Guard::Verify);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::Lockout);
+}
+
+TEST_F(GivEnergyLvGuard, VerifyMeasuresAFullMinuteOnceTheDataIsBack) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  trip(inverter, port);
+  datalayer.aggregate.current_dA = 0;
+  run(inverter, port, 20);
+  ASSERT_EQ(inverter.guard(), Guard::Verify);
+  datalayer.battery.status.CAN_battery_still_alive = 0;
+  run(inverter, port, 90);
+  datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;
+  run(inverter, port, 59);
+  EXPECT_EQ(inverter.guard(), Guard::Verify);
+  run(inverter, port, 1);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
