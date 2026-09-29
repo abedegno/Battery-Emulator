@@ -458,6 +458,140 @@ TEST(GivEnergyLvEvents, TheLockoutPutsTheEmulatorIntoFault) {
   reset_all_events();
 }
 
+// ---- Charge taper latch ----
+//
+// A replay of my real GivEnergy battery's charge showed its BMS cut HR26 to 3.20 A at the LFP
+// knee and held it there through 100%, releasing only once discharge had started. These check
+// that update_values() latches the taper the same way, and releases it again once the highest
+// cell falls below kTrickleRelease_mV.
+
+namespace {
+
+class GivEnergyLvTaperLatch : public GivEnergyLvInverter {
+ protected:
+  void SetUp() override {
+    GivEnergyLvInverter::SetUp();
+    init_events();
+    reset_all_events();
+    datalayer.aggregate.max_charge_current_dA = 800;  // 80 A: well above the trickle
+  }
+  void TearDown() override { reset_all_events(); }
+};
+
+}  // namespace
+
+TEST_F(GivEnergyLvTaperLatch, LatchesAtTheTrickleAndReleasesOffTheTop) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.cell_max_voltage_mV = 3550;  // the taper reaches the trickle: latch
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 300);
+
+  datalayer.aggregate.cell_max_voltage_mV = 3460;  // relaxes; unlatched, the taper alone would
+                                                   // already give 8130, above the 80 A battery
+                                                   // limit that would otherwise cap it to 8000
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 300) << "should still be latched to the trickle";
+
+  datalayer.aggregate.cell_max_voltage_mV = 3410;  // still at or above the release threshold
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 300);
+
+  datalayer.aggregate.cell_max_voltage_mV = 3390;  // below kTrickleRelease_mV: released
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 8000);  // back to the battery limit
+}
+
+TEST_F(GivEnergyLvTaperLatch, DoesNotLatchBeforeTheTrickle) {
+  FakeSerial port;
+  datalayer.aggregate.max_charge_current_dA = 1000;  // 100 A, capped to 9000 before any taper
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.cell_max_voltage_mV = 3520;  // short of kTaperEnd_mV: no latch yet
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 2910);
+
+  datalayer.aggregate.cell_max_voltage_mV = 3460;  // relaxes further, never having reached it
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 8130) << "latched without ever reaching the trickle";
+}
+
+TEST_F(GivEnergyLvTaperLatch, StopStillWinsWhileLatched) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.cell_max_voltage_mV = 3550;  // engage the latch
+  inverter.update_values();
+  ASSERT_EQ(inverter.snapshot().charge_limit_cA, 300);
+
+  datalayer.aggregate.cell_max_voltage_mV = 3600;  // the cell stop still wins over the latch
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 0);
+}
+
+TEST_F(GivEnergyLvTaperLatch, BatteryLimitLowerThanTheTrickleStillWins) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.cell_max_voltage_mV = 3550;  // engage the latch
+  inverter.update_values();
+  ASSERT_EQ(inverter.snapshot().charge_limit_cA, 300);
+
+  datalayer.aggregate.max_charge_current_dA = 20;  // 2.0 A: below even the trickle
+  inverter.update_values();                        // still latched, the cell hasn't moved
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 200);
+}
+
+TEST_F(GivEnergyLvTaperLatch, HoldsTheLatchStateWhileDataIsStale) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.cell_max_voltage_mV = 3550;  // engage the latch
+  inverter.update_values();
+  ASSERT_EQ(inverter.snapshot().charge_limit_cA, 300);
+
+  datalayer.battery.status.CAN_battery_still_alive = 0;  // stale, before safety.cpp raises the event
+  datalayer.aggregate.cell_max_voltage_mV = 3390;        // would release the latch, but it's stale
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 300) << "advanced the latch on stale data";
+
+  datalayer.battery.status.CAN_battery_still_alive = CAN_STILL_ALIVE;  // live again
+  inverter.update_values();  // the cell is already below the release threshold
+  EXPECT_EQ(inverter.snapshot().charge_limit_cA, 8000);
+}
+
+TEST_F(GivEnergyLvTaperLatch, WireReplyCarriesTheLatchedTrickle) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.cell_max_voltage_mV = 3550;  // engage the latch
+  inverter.update_values();
+  datalayer.aggregate.cell_max_voltage_mV = 3460;  // relaxed, but still latched
+  inverter.update_values();
+
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(millis64() + 4);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  EXPECT_EQ(port.tx[3 + 52], 0x01);  // HR26 = 300 (3.00 A), not the unlatched ~8130
+  EXPECT_EQ(port.tx[3 + 53], 0x2C);
+}
+
+TEST_F(GivEnergyLvTaperLatch, AFreshInstanceStartsUnlatched) {
+  FakeSerial port1;
+  datalayer.aggregate.max_charge_current_dA = 1000;  // 100 A, capped to 9000 before any taper
+  {
+    GivEnergyLvRs485Inverter inverter(port1);
+    datalayer.aggregate.cell_max_voltage_mV = 3550;  // engage the latch
+    inverter.update_values();
+    datalayer.aggregate.cell_max_voltage_mV = 3460;  // relaxed, but still latched
+    inverter.update_values();
+    ASSERT_EQ(inverter.snapshot().charge_limit_cA, 300);
+  }
+
+  // A restart: a fresh instance sees the same relaxed cell with no memory of the old latch.
+  FakeSerial port2;
+  GivEnergyLvRs485Inverter fresh(port2);
+  fresh.update_values();  // cell_max_voltage_mV is still 3460 from above
+  EXPECT_EQ(fresh.snapshot().charge_limit_cA, 8130) << "a restart should not inherit the latch";
+}
+
 // ---- Calibration guard ----
 //
 // During a GivEnergy battery calibration the inverter holds both current limits at 8 A or more,

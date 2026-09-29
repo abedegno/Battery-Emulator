@@ -33,6 +33,7 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   void enter_guard(Guard state, uint64_t now_ms);
   void lock_out(uint8_t trigger, uint64_t now_ms);
   void apply_guard(givenergy_lv::Snapshot& s) const;
+  void apply_taper_latch(givenergy_lv::Snapshot& s);
 
   // Modbus RTU wants 3.5 character times (3.6 ms at 9600) before a reply.
   static constexpr uint32_t kTurnaroundMs = 4;
@@ -69,6 +70,12 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   bool verified_ = false;  // a check has passed; verified_ms_ is when the last one did
   uint64_t verified_ms_ = 0;
   uint8_t lockout_trigger_ = 0;
+  // Set once the charge taper reaches the trickle and cleared once the cells come off the top
+  // (see apply_taper_latch()): mirrors my real battery's BMS holding HR26 at 3.20 A through the
+  // top of charge rather than letting it spring back up as the cells relax. Per instance: a
+  // restart clears it, which is fine: if the pack is still full, charging pushes the highest cell
+  // back to kTaperEnd_mV within minutes and the latch re-engages.
+  bool taper_latched_ = false;
 };
 
 #endif

@@ -34,13 +34,16 @@ constexpr int kCells = 16;
 // of charge; we mirror that so an LFP pack reaches its voltage knee at low current instead of
 // letting the inverter's own ~58 V over-voltage trip do the job (it reads ~1.3 V above the pack
 // at 60 A, so a hard cutoff at full current would trip it well before the pack is actually full).
-constexpr uint16_t kTaperStart_mV = 3450;     // taper begins here: no reduction below this
-constexpr uint16_t kTaperEnd_mV = 3550;       // taper reaches the trickle rate here
-constexpr uint16_t kTrickle_cA = 300;         // 3 A trickle from kTaperEnd_mV to kCellStop_mV: lets
-                                              // the BMS balance the top cells without stalling
-constexpr uint16_t kCellStop_mV = 3600;       // charging stops here: belt and braces, since
-                                              // Battery-Emulator's own cell over-voltage check
-                                              // isn't effective for this battery module
+constexpr uint16_t kTaperStart_mV = 3450;  // taper begins here: no reduction below this
+constexpr uint16_t kTaperEnd_mV = 3550;    // taper reaches the trickle rate here
+constexpr uint16_t kTrickle_cA = 300;      // 3 A trickle from kTaperEnd_mV to kCellStop_mV: lets
+                                           // the BMS balance the top cells without stalling
+constexpr uint16_t kCellStop_mV = 3600;    // charging stops here: belt and braces, since
+                                           // Battery-Emulator's own cell over-voltage check
+                                           // isn't effective for this battery module
+// Below this, the charge taper's latch releases (see apply_taper_latch()): mirrors my GivEnergy
+// BMS holding 3.20 A through full; releases once the pack has clearly come off the top.
+constexpr uint16_t kTrickleRelease_mV = 3400;
 constexpr uint16_t kCellUnderStop_mV = 2900;  // LFP low-cell stop: backup to the battery's own
                                               // discharge limit already going to 0
 
@@ -170,6 +173,7 @@ void GivEnergyLvRs485Inverter::update_values() {
   }
   snapshot_ = snapshot_from_datalayer();
   apply_guard(snapshot_);
+  apply_taper_latch(snapshot_);
 
   if (incoming_message_counter_ > 0) {
     incoming_message_counter_--;
@@ -405,6 +409,27 @@ void GivEnergyLvRs485Inverter::apply_guard(givenergy_lv::Snapshot& s) const {
     case Guard::Normal:
     case Guard::Verify:
       break;
+  }
+}
+
+// A replay of my real GivEnergy battery's charge showed its BMS cut HR26 to 3.20 A at the LFP
+// knee and then held it there for 3 h 43 min through 100%, before releasing it again. charge_taper_cA() alone doesn't do that: it follows the highest cell live, so as the
+// cells relax once the current drops, HR26 springs back up and invites the inverter to push
+// current into a full pack again. This latches the taper at kTrickle_cA once it gets there, and
+// holds it until the highest cell falls below kTrickleRelease_mV. Only evaluated while the
+// battery data is live (reused from the calibration guard); while it's stale, the latch just
+// keeps whatever state it was last in.
+void GivEnergyLvRs485Inverter::apply_taper_latch(givenergy_lv::Snapshot& s) {
+  if (battery_data_live()) {
+    const uint16_t max_cell_mV = datalayer.aggregate.cell_max_voltage_mV;
+    if (!taper_latched_ && max_cell_mV >= kTaperEnd_mV) {
+      taper_latched_ = true;
+    } else if (taper_latched_ && max_cell_mV < kTrickleRelease_mV) {
+      taper_latched_ = false;
+    }
+  }
+  if (taper_latched_) {
+    s.charge_limit_cA = std::min(s.charge_limit_cA, kTrickle_cA);
   }
 }
 
