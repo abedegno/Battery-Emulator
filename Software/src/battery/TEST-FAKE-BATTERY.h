@@ -44,9 +44,15 @@ class TestFakeBattery : public CanBattery, public BatteryHtmlRenderer {
 
   static const int MAX_CELL_DEVIATION_MV = 9999;
 
+#ifdef BENCH_FAKE_ECO
+  // Bench build only: look like a Fogstar ECO 16.1 kWh (16S LFP, 314 Ah)
+  static const int NUMBER_OF_CELLS = 16;
+  static const int CELL_SPREAD_MV = 5;
+#else
   static const int NUMBER_OF_CELLS = 96;
   // Random spread applied on top of the evenly divided pack voltage, per cell
   static const int CELL_SPREAD_MV = 20;
+#endif
   // Simulated balancing starts once the calculated SOC is above this level
   static const uint16_t BALANCING_START_SOC_PPTT = 8500;  // 85.00%
 };

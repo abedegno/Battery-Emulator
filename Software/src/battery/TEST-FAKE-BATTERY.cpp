@@ -12,7 +12,11 @@ void TestFakeBattery::
 
   datalayer_battery->status.current_dA = 0;  // 0 A
 
+#ifdef BENCH_FAKE_ECO
+  datalayer_battery->info.total_capacity_Wh = 16077;  // Fogstar ECO: 314 Ah x 51.2 V
+#else
   datalayer_battery->info.total_capacity_Wh = 30000;  // 30kWh
+#endif
 
   // SOC follows the user set pack voltage linearly between the design voltage limits,
   // so that 245.0V reads 0.00% and 404.0V reads 100.00%.
@@ -37,9 +41,14 @@ void TestFakeBattery::
   datalayer_battery->status.remaining_capacity_Wh = static_cast<uint32_t>(
       static_cast<uint64_t>(datalayer_battery->info.total_capacity_Wh) * calculated_soc_pptt / 10000u);
 
+#ifdef BENCH_FAKE_ECO
+  datalayer_battery->status.temperature_min_dC = 200;  // 20.0*C
+  datalayer_battery->status.temperature_max_dC = 220;  // 22.0*C
+#else
   datalayer_battery->status.temperature_min_dC = 50;  // 5.0*C
 
   datalayer_battery->status.temperature_max_dC = 60;  // 6.0*C
+#endif
 
   datalayer_battery->status.max_discharge_power_W = 5000;  // 5kW
 
@@ -143,20 +152,34 @@ void TestFakeBattery::setup(void) {  // Performs one time setup at startup
   strncpy(datalayer.system.info.battery_protocol, Name, 63);
   datalayer.system.info.battery_protocol[63] = '\0';
 
+#ifdef BENCH_FAKE_ECO
+  datalayer_battery->info.max_design_voltage_dV = 576;  // 57.6V, 3.60 V per cell
+  datalayer_battery->info.min_design_voltage_dV = 432;  // 43.2V, 2.70 V per cell
+#else
   datalayer_battery->info.max_design_voltage_dV =
       4040;  // 404.4V, over this, charging is not possible (goes into forced discharge)
   datalayer_battery->info.min_design_voltage_dV = 2450;  // 245.0V under this, discharging further is disabled
+#endif
   datalayer_battery->info.number_of_cells = NUMBER_OF_CELLS;
 
   // The fake cell voltages are derived from the pack voltage, so the cell limits have to agree with
   // the pack design limits. With the datalayer defaults (4300mV/2700mV) a pack driven to its own
   // minimum of 245.0V (2552mV per cell) would raise a cell undervoltage event straight away.
+#ifdef BENCH_FAKE_ECO
+  datalayer_battery->info.max_cell_voltage_mV = 3650;  // LFP, as the Growatt LV reader sets
+  datalayer_battery->info.min_cell_voltage_mV = 2500;
+#else
   datalayer_battery->info.max_cell_voltage_mV = 4250;  // 404.0V pack -> 4208mV per cell
   datalayer_battery->info.min_cell_voltage_mV = 2500;  // 245.0V pack -> 2552mV per cell
+#endif
 
   // Default fake pack voltage and SOH, both editable per pack on the More Battery Info page
   if (datalayer_battery->status.voltage_dV == 0) {
+#ifdef BENCH_FAKE_ECO
+    datalayer_battery->status.voltage_dV = 532;  // 53.2V, 3.325 V per cell (mid-SoC LFP)
+#else
     datalayer_battery->status.voltage_dV = 3700;  // 370.0V
+#endif
   }
   datalayer_battery->status.soh_pptt = 9900;  // 99.00%
 
