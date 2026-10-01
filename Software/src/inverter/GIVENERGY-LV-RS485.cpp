@@ -485,15 +485,20 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   // bound to 0 outside a calibration, and to ~180 W during one, lower than the 8 A floor a zero
   // HR26 leaves; bit 3 (under-voltage) cuts discharge to 10%. Neither faults or latches. My real
   // battery raised bit 2 for 271 s straight after its last top-up to 57.5 V at the top of charge.
-  // This module raises it where HR26 already goes to 0 (the taper's own stop, or the user's
-  // charge-voltage ceiling), and bit 3 at kCellUnderStop_mV, as backups to HR26/HR27 going to 0.
+  // The battery side leads: whenever it allows no charge (its BMS disabled charging or stopped
+  // sending limits, or the safety layer applied its voltage limit, the user's ceiling or 100% SoC),
+  // HR26 is 0 and bit 2 goes with it; likewise a zero discharge limit raises bit 3. This module's
+  // own cell thresholds (the taper's stop and kCellUnderStop_mV) and the user's charge-voltage
+  // ceiling stay as backstops in case the battery side doesn't stop first.
   const bool fault = datalayer.system.status.system_status == FAULT;
   const bool user_ceiling_reached = datalayer.battery_settings.user_set_voltage_limits_active &&
                                     agg.voltage_dV >= datalayer.battery_settings.max_user_set_charge_voltage_dV;
-  if (fault || agg.cell_max_voltage_mV >= kCellStop_mV || user_ceiling_reached) {
+  const bool battery_stops_charge = agg.max_charge_current_dA == 0;
+  const bool battery_stops_discharge = agg.max_discharge_current_dA == 0;
+  if (fault || battery_stops_charge || agg.cell_max_voltage_mV >= kCellStop_mV || user_ceiling_reached) {
     s.alarms |= 0x0004;
   }
-  if (fault || agg.cell_min_voltage_mV <= kCellUnderStop_mV) {
+  if (fault || battery_stops_discharge || agg.cell_min_voltage_mV <= kCellUnderStop_mV) {
     s.alarms |= 0x0008;
   }
   return s;

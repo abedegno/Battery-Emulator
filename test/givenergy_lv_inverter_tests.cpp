@@ -67,6 +67,10 @@ class GivEnergyLvInverter : public ::testing::Test {
     // unrealistic inverted pack, so give it a matching normal value too.
     datalayer.aggregate.cell_max_voltage_mV = 3300;
     datalayer.aggregate.cell_min_voltage_mV = 3280;
+    // The battery allows 80 A each way: a zero limit means the battery side has stopped that
+    // direction, which HR20 reports (see *WhenTheBatteryAllowsNo* below).
+    datalayer.aggregate.max_charge_current_dA = 800;
+    datalayer.aggregate.max_discharge_current_dA = 800;
   }
 };
 
@@ -323,6 +327,32 @@ TEST_F(GivEnergyLvInverter, UnderVoltageAlarmAtTheLowCellStop) {
   EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0008, 0x0008u);
 }
 
+// The battery's own BMS (or Battery-Emulator's safety layer acting on its voltage limit, the user
+// ceiling or SoC) stops charging by zeroing the charge limit. HR26 = 0 alone leaves the DSP a
+// ~1 A charge bound until its 30 s "battery full" block, so report it as full (HR20 bit 2) too.
+TEST_F(GivEnergyLvInverter, FullAlarmWhenTheBatteryAllowsNoCharge) {
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+  datalayer.aggregate.max_charge_current_dA = 0;
+  const auto s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.charge_limit_cA, 0);
+  EXPECT_EQ(s.alarms, 0x0004u);
+}
+
+// Likewise a zero discharge limit from the battery side is reported as empty (HR20 bit 3).
+TEST_F(GivEnergyLvInverter, EmptyAlarmWhenTheBatteryAllowsNoDischarge) {
+  datalayer.aggregate.max_discharge_current_dA = 0;
+  const auto s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.discharge_limit_cA, 0);
+  EXPECT_EQ(s.alarms, 0x0008u);
+}
+
+// A limit that is low but not zero (the battery tapering, not stopping) raises nothing.
+TEST_F(GivEnergyLvInverter, NoAlarmWhileTheBatteryOnlyReducesItsLimits) {
+  datalayer.aggregate.max_charge_current_dA = 30;  // 3 A
+  datalayer.aggregate.max_discharge_current_dA = 30;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+}
+
 TEST_F(GivEnergyLvInverter, NoAlarmsInNormalRunning) {
   datalayer.aggregate.cell_max_voltage_mV = 3300;
   datalayer.aggregate.cell_min_voltage_mV = 3280;
@@ -430,6 +460,8 @@ TEST_F(GivEnergyLvInverter, MissingCellsAreFilledFromMinAndMax) {
 TEST_F(GivEnergyLvInverter, NoBatteryYetStillGivesInRangeValues) {
   datalayer.aggregate.cell_max_voltage_mV = 0;
   datalayer.aggregate.cell_min_voltage_mV = 0;
+  datalayer.aggregate.max_charge_current_dA = 0;  // no battery limits yet either
+  datalayer.aggregate.max_discharge_current_dA = 0;
   const givenergy_lv::Snapshot s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
   for (int i = 0; i < 16; i++) {
     EXPECT_GT(s.cells_mV[i], 2200) << "cell " << i;
@@ -970,6 +1002,22 @@ TEST_F(GivEnergyLvGuard, NoTripOnAHeavyDischargeWithinHr27) {
   EXPECT_EQ(inverter.guard(), Guard::Normal);
 }
 
+// The battery zeroing its charge limit now raises HR20 bit 2, which arms trigger D. An inverter
+// that obeys, with the charge current decaying to nothing inside 20 s, must not trip it.
+TEST_F(GivEnergyLvGuard, NoTripWhenTheBatteryStopsChargeAndTheChargeDecays) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 500;
+  run(inverter, port, 5);
+  datalayer.aggregate.max_charge_current_dA = 0;  // the BMS stops charging
+  for (int amps_dA : {400, 300, 200, 100, 50, 20, 0}) {
+    datalayer.aggregate.current_dA = amps_dA;
+    run(inverter, port, 3);
+  }
+  run(inverter, port, 60);
+  EXPECT_EQ(inverter.guard(), Guard::Normal);
+}
+
 TEST_F(GivEnergyLvGuard, NoTripOnDischargeWhileReportingFull) {
   FakeSerial port;
   datalayer.aggregate.cell_max_voltage_mV = 3600;  // HR20 bit 2, as my real battery sent it
@@ -1008,17 +1056,23 @@ TEST_F(GivEnergyLvGuard, NoTripOnTheInvertersOwnDischargeFloor) {
   EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
 }
 
-TEST_F(GivEnergyLvGuard, NoTripOnTheInvertersOwnChargeFloor) {
+// A zero charge limit from the battery side now always comes with HR20 bit 2, and with bit 2 the
+// DSP drops its charge bound to 0 at once (HR26 = 0 alone would still let ~1 A through). So up
+// to 2 A is tolerated indefinitely, but more than that for 30 s is the inverter ignoring "full":
+// trigger D, before trigger A's 60 s.
+TEST_F(GivEnergyLvGuard, AZeroChargeLimitIsReportedAsFullForTheGuard) {
   FakeSerial port;
-  datalayer.aggregate.max_charge_current_dA = 0;  // HR26 = 0 still lets ~1 A through
+  datalayer.aggregate.max_charge_current_dA = 0;
   GivEnergyLvRs485Inverter inverter(port);
-  datalayer.aggregate.current_dA = 30;  // 3 A: not over max(HR26, 1 A) + 2 A
+  datalayer.aggregate.current_dA = 20;  // 2.0 A: not over the 2 A margin
   run(inverter, port, 3600);
   EXPECT_EQ(inverter.guard(), Guard::Normal);
-  datalayer.aggregate.current_dA = 31;
-  run(inverter, port, 61);
+  datalayer.aggregate.current_dA = 21;
+  run(inverter, port, 30);
+  EXPECT_EQ(inverter.guard(), Guard::Normal) << "tripped a second early";
+  run(inverter, port, 1);
   EXPECT_EQ(inverter.guard(), Guard::EndingBoth);
-  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).data, 1);
+  EXPECT_EQ(event(EVENT_INVERTER_LIMITS_IGNORED).data, 4);  // trigger D
 }
 
 TEST_F(GivEnergyLvGuard, AfterFullWinsOverTheChargeLimitAtTheCeiling) {
