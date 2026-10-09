@@ -82,8 +82,8 @@ TEST_F(GivEnergyLvInverter, RepliesAfterTheTurnaround) {
   inverter.update_values();
   port.feed(kHrPoll);
   inverter.receive();
-  EXPECT_TRUE(port.tx.empty()) << "replied inside the 3.5-character turnaround";
-  set_millis64(1004);
+  EXPECT_TRUE(port.tx.empty()) << "replied before the 75 ms turnaround the G3 needs";
+  set_millis64(1075);
   inverter.receive();
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[0], 0x01);
@@ -98,21 +98,21 @@ TEST_F(GivEnergyLvInverter, FindsAPollAfterLineNoise) {
   port.feed({0x00, 0xFF, 0x13, 0x01});
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(1004);
+  set_millis64(1075);
   inverter.receive();
   EXPECT_EQ(port.tx.size(), 61u);
 }
 
-TEST_F(GivEnergyLvInverter, StillWithholdsTheReplyThreeMillisecondsIn) {
+TEST_F(GivEnergyLvInverter, StillWithholdsTheReply74MillisecondsIn) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
   inverter.update_values();
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(1003);
+  set_millis64(1074);
   inverter.receive();
-  EXPECT_TRUE(port.tx.empty()) << "replied inside the 3.5-character turnaround";
-  set_millis64(1004);
+  EXPECT_TRUE(port.tx.empty()) << "replied before the 75 ms turnaround the G3 needs";
+  set_millis64(1075);
   inverter.receive();
   EXPECT_EQ(port.tx.size(), 61u);
 }
@@ -125,7 +125,7 @@ TEST_F(GivEnergyLvInverter, AssemblesARequestSplitAcrossTwoReceiveCalls) {
   inverter.receive();
   port.feed({kHrPoll.begin() + 3, kHrPoll.end()});
   inverter.receive();
-  set_millis64(1004);
+  set_millis64(1075);
   inverter.receive();
   EXPECT_EQ(port.tx.size(), 61u);
 }
@@ -137,21 +137,21 @@ TEST_F(GivEnergyLvInverter, IgnoresItsOwnWriteEchoButAnswersALaterRetry) {
   const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
   port.feed(write);
   inverter.receive();
-  set_millis64(1004);
+  set_millis64(1075);
   inverter.receive();
   ASSERT_EQ(port.tx, write);
 
   port.feed(write);  // the transceiver hearing our own reply
-  set_millis64(1010);
+  set_millis64(1081);
   inverter.receive();
-  set_millis64(1020);
+  set_millis64(1091);
   inverter.receive();
   EXPECT_EQ(port.tx.size(), 8u) << "answered its own echo";
 
-  set_millis64(1200);  // the inverter genuinely writing again
+  set_millis64(1300);  // the inverter genuinely writing again
   port.feed(write);
   inverter.receive();
-  set_millis64(1204);
+  set_millis64(1375);
   inverter.receive();
   EXPECT_EQ(port.tx.size(), 16u);
 }
@@ -164,13 +164,13 @@ TEST_F(GivEnergyLvInverter, IgnoresAnEchoThatArrivesInTheSameCallAsTheSend) {
   port.feed(write);
   inverter.receive();
 
-  set_millis64(1004);
+  set_millis64(1075);
   port.feed(write);  // the echo is already on the wire before we send our reply this call
   inverter.receive();
 
-  set_millis64(1010);
+  set_millis64(1081);
   inverter.receive();
-  set_millis64(1020);
+  set_millis64(1091);
   inverter.receive();
   EXPECT_EQ(port.tx.size(), 8u) << "answered its own echo";
 }
@@ -182,7 +182,7 @@ TEST_F(GivEnergyLvInverter, ReplyUsesTheDatalayerFromTheLastUpdate) {
   inverter.update_values();
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(1004);
+  set_millis64(1075);
   inverter.receive();
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[3 + 52], 0x13);  // HR26 = 5000 (50.00 A)
@@ -196,7 +196,7 @@ TEST_F(GivEnergyLvInverter, StaysSilentUntilTheBatteryHasReported) {
   inverter.update_values();
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(1004);
+  set_millis64(1075);
   inverter.receive();
   EXPECT_TRUE(port.tx.empty()) << "replied before the battery had reported a real voltage";
 
@@ -206,7 +206,7 @@ TEST_F(GivEnergyLvInverter, StaysSilentUntilTheBatteryHasReported) {
   port.feed(kHrPoll);
   set_millis64(1100);
   inverter.receive();
-  set_millis64(1104);
+  set_millis64(1175);
   inverter.receive();
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[3 + 44], 0x14);  // HR22 = 5200 (52.00 V)
@@ -222,9 +222,9 @@ TEST_F(GivEnergyLvInverter, DiscardsRequestsHeardBeforeReady) {
 
   datalayer.battery.status.voltage_dV = 520;
   inverter.update_values();
-  set_millis64(1004);
+  set_millis64(1075);
   inverter.receive();
-  set_millis64(1010);
+  set_millis64(1081);
   inverter.receive();
   EXPECT_TRUE(port.tx.empty()) << "answered a request that arrived before the battery was ready";
 }
@@ -367,7 +367,7 @@ TEST_F(GivEnergyLvInverter, FaultAlarmBitsAppearOnTheWire) {
   inverter.update_values();
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(1004);
+  set_millis64(1075);
   inverter.receive();
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[3 + 40], 0x00);  // HR20 = 0x000C: over- and under-voltage alarms
@@ -598,7 +598,7 @@ TEST_F(GivEnergyLvTaperLatch, WireReplyCarriesTheLatchedTrickle) {
 
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(millis64() + 4);
+  set_millis64(millis64() + 75);
   inverter.receive();
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[3 + 52], 0x01);  // HR26 = 300 (3.00 A), not the unlatched ~8130
@@ -653,7 +653,7 @@ class GivEnergyLvGuard : public GivEnergyLvInverter {
   static void run(GivEnergyLvRs485Inverter& inverter, FakeSerial& port, int seconds) {
     for (int i = 0; i < seconds; i++) {
       const uint64_t start = millis64();
-      set_millis64(start + 990);
+      set_millis64(start + 900);
       port.feed(kHrPoll);
       inverter.receive();
       set_millis64(start + 1000);
@@ -871,7 +871,7 @@ TEST_F(GivEnergyLvGuard, TheEndingBitsGoOutOnTheWire) {
   port.tx.clear();
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(millis64() + 4);
+  set_millis64(millis64() + 75);
   inverter.receive();
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[3 + 40], 0x00);  // HR20 = 0x000C: empty and full
@@ -885,7 +885,7 @@ TEST_F(GivEnergyLvGuard, TheEndingBitsGoOutOnTheWire) {
   port.tx.clear();
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(millis64() + 4);
+  set_millis64(millis64() + 75);
   inverter.receive();
   ASSERT_EQ(port.tx.size(), 61u);
   EXPECT_EQ(port.tx[3 + 41], 0x04);  // HR20 = 0x0004: full alone
@@ -925,7 +925,7 @@ TEST_F(GivEnergyLvGuard, LocksOutWhenTheInverterKeepsOverriding) {
   port.tx.clear();
   port.feed(kHrPoll);
   inverter.receive();
-  set_millis64(millis64() + 4);
+  set_millis64(millis64() + 75);
   inverter.receive();
   EXPECT_TRUE(port.tx.empty()) << "answered the inverter while locked out";
   EXPECT_TRUE(port.rx.empty()) << "left the poll in the receive buffer";
@@ -949,7 +949,7 @@ TEST_F(GivEnergyLvGuard, LockoutStopsAReplyAlreadyQueued) {
   set_millis64(millis64() + 1);
   inverter.update_values();
   ASSERT_EQ(inverter.guard(), Guard::Lockout);
-  set_millis64(millis64() + 10);
+  set_millis64(millis64() + 80);  // past the turnaround, when the queued reply would have gone
   inverter.receive();
   EXPECT_TRUE(port.tx.empty()) << "sent a reply queued before the lockout";
 }

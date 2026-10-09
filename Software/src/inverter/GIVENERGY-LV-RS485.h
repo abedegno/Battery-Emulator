@@ -35,8 +35,12 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   void apply_guard(givenergy_lv::Snapshot& s) const;
   void apply_taper_latch(givenergy_lv::Snapshot& s);
 
-  // Modbus RTU wants 3.5 character times (3.6 ms at 9600) before a reply.
-  static constexpr uint32_t kTurnaroundMs = 4;
+  // Wait before replying. Modbus RTU only needs 3.5 character times (3.6 ms at 9600), but a G3
+  // isn't ready to receive that soon after its own request: an emulator replying after about 1 ms
+  // got a BMS communication failure, and 50 ms worked. My GivEnergy battery replies 72 to 96 ms
+  // after the end of each request (median 93 ms), so wait inside that range. Even a 61-byte HR
+  // reply then ends well inside the G3's 240 ms poll cycle.
+  static constexpr uint32_t kTurnaroundMs = 75;
   // A frame identical to the write echo just sent, this soon after, is the transceiver hearing itself.
   static constexpr uint32_t kEchoWindowMs = 50;
   // As PYLON-LV-RS485: 12 updates of 1 s (about 12 s) without a request raise the missing event.
