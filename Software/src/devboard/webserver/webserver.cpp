@@ -250,7 +250,8 @@ void canReplayTask(void* param) {
         }
 
         currentFrame.FD = (datalayer.system.info.can_replay_interface == CANFD_NATIVE) ||
-                          (datalayer.system.info.can_replay_interface == CANFD_ADDON_MCP2518);
+                          (datalayer.system.info.can_replay_interface == CANFD_ADDON_MCP2518) ||
+                          (datalayer.system.info.can_replay_interface == CANFD_ADDON_MCP2518_2);
         currentFrame.ext_ID = (currentFrame.ID > 0x7F0);
 
         transmit_can_frame_to_interface(&currentFrame, (CAN_Interface)datalayer.system.info.can_replay_interface);
@@ -263,6 +264,55 @@ void canReplayTask(void* param) {
 
   isReplayRunning = false;  // Mark replay as stopped
   vTaskDelete(NULL);
+}
+
+/* A percentage typed into the settings page, such as "80.5", in integer-percent x 100 and rounded
+   to the 0.1 % steps the page shows and the settings are saved in. False for an empty or
+   non-numeric value, or one outside lowest..highest. String::toFloat() took either for 0 %, and
+   truncating toFloat() * 100 stored 80.2 as 80.19 %, which the save then cut to 80.1 %. */
+static bool parse_soc_percentage(const String& text, int32_t lowest, int32_t highest, int32_t& percentage) {
+  const char* begin = text.c_str();
+  char* end = nullptr;
+  const double percent = strtod(begin, &end);
+  if (end == begin) {
+    return false;
+  }
+  while (*end == ' ') {
+    end++;
+  }
+  // NaN fails both comparisons. The ends are whole 0.1 % steps, so rounding stays within them
+  if (*end != '\0' || !(percent * 100.0 >= lowest && percent * 100.0 <= highest)) {
+    return false;
+  }
+  const double tenths = percent * 10.0;
+  percentage = (int32_t)(tenths < 0 ? tenths - 0.5 : tenths + 0.5) * 10;  // Half away from zero
+  return true;
+}
+
+/* An edit of one end of the SOC window from the settings page. Refused unless it parses and
+   leaves a usable window with the other end, both the one in use and the saved one, which differ
+   while MQTT SET_SCALESOC has moved the window. Applied to both only with apply set, so that the
+   same check serves as the route's validator. */
+static bool edit_soc_window_end(const String& text, bool max_end, bool apply) {
+  DATALAYER_BATTERY_SETTINGS_TYPE& battery_settings = datalayer.battery_settings;
+  int32_t percentage = 0;
+  if (!parse_soc_percentage(text, max_end ? SOC_MAX_PERCENTAGE_LOWEST : SOC_MIN_PERCENTAGE_LOWEST,
+                            max_end ? SOC_MAX_PERCENTAGE_HIGHEST : SOC_MIN_PERCENTAGE_HIGHEST, percentage)) {
+    return false;
+  }
+  const int32_t min_in_use = max_end ? battery_settings.min_percentage : percentage;
+  const int32_t max_in_use = max_end ? percentage : battery_settings.max_percentage;
+  const int32_t min_saved = max_end ? battery_settings.user_set_min_percentage : percentage;
+  const int32_t max_saved = max_end ? percentage : battery_settings.user_set_max_percentage;
+  if (!soc_window_valid(min_in_use, max_in_use) || !soc_window_valid(min_saved, max_saved)) {
+    return false;
+  }
+  if (apply && max_end) {
+    battery_settings.max_percentage = battery_settings.user_set_max_percentage = (uint16_t)percentage;
+  } else if (apply) {
+    battery_settings.min_percentage = battery_settings.user_set_min_percentage = (int16_t)percentage;
+  }
+  return true;
 }
 
 void def_route_with_auth(const char* uri, AsyncWebServer& serv, WebRequestMethodComposite method,
@@ -343,6 +393,16 @@ void init_webserver() {
   // Route for going to advanced battery info web page
   def_route_with_auth("/advanced", server, HTTP_GET,
                       [](AsyncWebServerRequest* request) { send_advanced_battery_page(request); });
+
+  // The look of the navigation row and buttons shared by the sub pages (INDEX_HTML_NAV_LINK in
+  // index_html.h). One copy here instead of one in every page, cached by the browser.
+  def_route_with_auth("/nav.css", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    static const char nav_css[] PROGMEM = INDEX_HTML_NAV_CSS;
+    AsyncWebServerResponse* response =
+        request->beginResponse(200, "text/css", reinterpret_cast<const uint8_t*>(nav_css), sizeof(nav_css) - 1);
+    response->addHeader("Cache-Control", "max-age=3600");
+    request->send(response);
+  });
 
   // Loader for the help buttons (HELP_SCRIPT in index_html.h). Pre-compressed like the BYD page
   // below, and cached by the browser so the pages that use it do not fetch it on every reload.
@@ -599,7 +659,7 @@ void init_webserver() {
       "DALYPWR0C",     "GPIOOPT5",      "GPIOOPT6",   "INVICNT",    "FOXESSTYPE",   "FOXESSSUBTYPE", "FOXESSMODULES",
       "CHGTAPERSTART", "CHGTAPERFLOOR", "SYSLOGPORT", "SYSLOGFAC",  "PERBMSRESETH",
 #ifndef SMALL_FLASH_DEVICE
-      "CTVNOM",        "CTANOM",        "QNHIPN",     "QNHVO",
+      "CTVNOM",        "CTANOM",        "QNHIPN",     "QNHVO",      "BMWI3SOCHAVR",
 #endif  // SMALL_FLASH_DEVICE
   };
 
@@ -915,17 +975,20 @@ void init_webserver() {
   // Route for editing Wh
   update_int_setting("/updateBatterySize", [](int value) { datalayer.battery.info.total_capacity_Wh = value; });
 
-  // Route for editing USE_SCALED_SOC
-  update_int_setting("/updateUseScaledSOC", [](int value) { datalayer.battery_settings.soc_scaling_active = value; });
+  // Route for editing USE_SCALED_SOC. Only "0" or "1": toInt() read an empty value as 0, so OK on
+  // an empty prompt used to switch the rescaling off
+  update_string_setting(
+      "/updateUseScaledSOC", [](String value) { datalayer.battery_settings.soc_scaling_active = (value == "1"); },
+      [](String value) { return value == "0" || value == "1"; });
 
   // Route for enabling recovery mode charging
   update_int_setting("/enableRecoveryMode",
                      [](int value) { datalayer.battery_settings.user_requests_forced_charging_recovery_mode = value; });
 
-  // Route for editing SOCMax
-  update_string_setting("/updateSocMax", [](String value) {
-    datalayer.battery_settings.max_percentage = static_cast<uint16_t>(value.toFloat() * 100);
-  });
+  // Route for editing SOCMax. Refused unless it leaves a usable window with the minimum
+  update_string_setting(
+      "/updateSocMax", [](String value) { edit_soc_window_end(value, true, true); },
+      [](String value) { return edit_soc_window_end(value, true, false); });
 
   // Route for pause/resume Battery emulator
   update_string("/pause", [](String value) { setBatteryPause(value == "true" || value == "1", false); });
@@ -1014,6 +1077,21 @@ void init_webserver() {
     request->send(200, "text/plain", "OK");
   });
 
+  // Save full charge interval to RAM + NVM
+  def_route_with_auth("/editBydAtto3FullChargeDays", server, HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("value")) {
+      int value = request->getParam("value")->value().toInt();
+      if (value >= 0 && value <= 30) {
+        datalayer_extended.bydAtto3.full_charge_every_days = (uint8_t)value;
+        Preferences prefs;
+        prefs.begin("batterySettings", false);
+        prefs.putUInt("BYDFCDAYS", (uint8_t)value);
+        prefs.end();
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
   // Route for editing AH Calibration BYD
   update_string_setting("/editCalTargetAH", [](String value) {
     datalayer_extended.bydAtto3.calibrationTargetAH = static_cast<uint16_t>(value.toFloat());
@@ -1078,10 +1156,11 @@ void init_webserver() {
     request->send(200, "text/plain", "OK");
   });
 
-  // Route for editing SOCMin
-  update_string_setting("/updateSocMin", [](String value) {
-    datalayer.battery_settings.min_percentage = static_cast<uint16_t>(value.toFloat() * 100);
-  });
+  // Route for editing SOCMin. Refused unless it leaves a usable window with the maximum. A negative
+  // minimum used to go through a cast to uint16_t, which is undefined for a negative float
+  update_string_setting(
+      "/updateSocMin", [](String value) { edit_soc_window_end(value, false, true); },
+      [](String value) { return edit_soc_window_end(value, false, false); });
 
   // Route for editing MaxChargeA
   update_string_setting("/updateMaxChargeA", [](String value) {

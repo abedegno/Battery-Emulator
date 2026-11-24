@@ -60,6 +60,23 @@ struct DATALAYER_BATTERY_INFO_TYPE {
   battery_chemistry_enum chemistry = battery_chemistry_enum::NCA;
 };
 
+// One bit per cell, cell 0 in bit 0 of the first byte. The old bool array stored a byte per cell.
+struct CellBalancingStatus {
+  bool get(size_t cell) const { return ((bits_[cell >> 3] >> (cell & 7)) & 0x01u) != 0; }
+
+  void set(size_t cell, bool on) {
+    const uint8_t mask = static_cast<uint8_t>(1u << (cell & 7));
+    if (on) {
+      bits_[cell >> 3] = static_cast<uint8_t>(bits_[cell >> 3] | mask);
+    } else {
+      bits_[cell >> 3] = static_cast<uint8_t>(bits_[cell >> 3] & static_cast<uint8_t>(~mask));
+    }
+  }
+
+ private:
+  uint8_t bits_[(MAX_AMOUNT_CELLS + 7) / 8] = {};
+};
+
 struct DATALAYER_BATTERY_STATUS_TYPE {
   /** uint32_t */
   /** Remaining energy capacity in Watt-hours */
@@ -176,11 +193,11 @@ struct DATALAYER_BATTERY_STATUS_TYPE {
    * Use with battery.info.number_of_cells to get valid data.
    */
   uint16_t cell_voltages_mV[MAX_AMOUNT_CELLS];
-  /** All balancing resistors status inside the pack, either on(1) or off(0).
+  /** Balancing resistor on(1) or off(0) for each cell.
    * Use with battery.info.number_of_cells to get valid data.
-   * Not available for all battery manufacturers.
+   * Not available for all battery manufacturers. Read and write with get() and set().
    */
-  bool cell_balancing_status[MAX_AMOUNT_CELLS];
+  CellBalancingStatus cell_balancing_status;
 };
 
 struct DATALAYER_BATTERY_SETTINGS_TYPE {
@@ -198,8 +215,12 @@ struct DATALAYER_BATTERY_SETTINGS_TYPE {
 
   /** Maximum percentage setting. Set this value to the highest real SOC
    * you want the inverter to be able to use. At this real SOC, the inverter
-   * will "see" 100% Example 8000 = 80.0% */
+   * will "see" 100% Example 8000 = 80.0%
+   * This is the window in use: MQTT SET_SCALESOC may move it until the next reboot */
   uint16_t max_percentage = 8000;
+  /** The maximum percentage the settings page set and the saved settings hold. Only the settings
+   * page changes it, so a save never persists a value MQTT SET_SCALESOC put in max_percentage */
+  uint16_t user_set_max_percentage = 8000;
   /** The user specified maximum allowed charge rate, in deciAmpere. 300 = 30.0 A, persisted to memory 
    * Updates later on via Settings */
   uint16_t max_user_set_charge_dA = 300;
@@ -228,8 +249,12 @@ struct DATALAYER_BATTERY_SETTINGS_TYPE {
 
   /** Minimum percentage setting. Set this value to the lowest real SOC
    * you want the inverter to be able to use. At this real SOC, the inverter
-   * will "see" 0% , Example 2000 = 20.0% */
+   * will "see" 0% , Example 2000 = 20.0%
+   * This is the window in use: MQTT SET_SCALESOC may move it until the next reboot */
   int16_t min_percentage = 2000;
+  /** The minimum percentage the settings page set and the saved settings hold, see
+   * user_set_max_percentage */
+  int16_t user_set_min_percentage = 2000;
 
   /** Sofar CAN Battery ID (0-15) used to parallel multiple packs */
   uint8_t sofar_user_specified_battery_id = 0;
@@ -244,6 +269,8 @@ struct DATALAYER_BATTERY_SETTINGS_TYPE {
   /** SOC scaling setting. Increases battery life. 
    * If true will rescale SOC between the configured min/max-percentage */
   bool soc_scaling_active = true;
+  /** Runtime only: scale up to 100% real SOC instead of max_percentage, so a full charge can finish */
+  bool soc_window_top_lifted = false;
   /** Parallel headroom tracking, from the settings page and only with two or three batteries: the
    * charge limit is raised above the lowest pack limit to what the packs take together. Off, the
    * inverter gets the lowest pack limit, as before the tracking existed. Read at boot only */
@@ -442,6 +469,16 @@ struct DATALAYER_SYSTEM_STATUS_TYPE {
   uint8_t CAN_inverter_still_alive = (CAN_STILL_ALIVE - 1);
   /** 0 if starting up, 1 if contactors engaged, 2 if the contactors controlled by battery-emulator is opened */
   uint8_t contactors_engaged = 0;
+  /** The relays as a BMS that is told about each of them is to see them (Nissan LEAF RLYP/BTONFN): those
+   *  the GPIO contactor control drives, the main pack's negative and positive contactor and precharge
+   *  relay and the single contactor of packs 2 and 3, as it drives them, except across a BMS reset that
+   *  keeps them closed. From when it cuts the BMS power they read open, and once that is back they close
+   *  again as after a cold start, see update_reported_relays(). All false without GPIO contactor control. */
+  bool reported_negative_closed = false;
+  bool reported_precharge_closed = false;
+  bool reported_positive_closed = false;
+  bool reported_battery2_closed = false;
+  bool reported_battery3_closed = false;
   /** True when the DC bus is actually energized towards the inverter (contactors closed and precharge
    *  complete). Single source of truth for inverter protocols that must not advertise an ACTIVE battery
    *  against a dead DC bus (e.g. BYD-Modbus / Fronius during the boot-gate + precharge window).

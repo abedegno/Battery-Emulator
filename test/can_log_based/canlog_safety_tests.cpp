@@ -7,6 +7,7 @@
 #include "../../Software/src/battery/BATTERIES.h"
 #include "../../Software/src/battery/CanBattery.h"
 #include "../../Software/src/battery/UdsCanBattery.h"
+#include "../../Software/src/datalayer/datalayer_extended.h"
 #include "../../Software/src/devboard/utils/events.h"
 
 #include <fstream>
@@ -79,29 +80,42 @@ class CanLogTestFixture : public testing::Test {
     UdsCanBattery* udsBattery = dynamic_cast<UdsCanBattery*>(battery);
     const auto& tx_frames = get_transmitted_frames();
 
-    // Does this message looks like a UDS/KWP2000 poll response?
-    if (udsBattery != nullptr && msg.ID >= 0x780 && msg.ID <= 0x7EF && (msg.data.u8[0] & 0xF0) == 0x10) {
-      // Extract the SID from the poll response
-      const uint8_t resp_sid = msg.data.u8[2];
-      uint16_t target_pid = msg.data.u8[3];
+    // Does this message look like a UDS/KWP2000 poll response? Responses come
+    // from an 11-bit physical response ID (0x780-0x7EF) or, for batteries that
+    // speak UDS over 29-bit addressing (0x18DAxxyy), any extended ID. Both the
+    // ISO-TP first frame of a multi-frame response (PCI 0x1N: SID at byte 2)
+    // and a single-frame response (PCI 0x0N: SID at byte 1) must prime the
+    // battery, otherwise the superclass drops the reply as "nothing in flight".
+    const bool uds_response_id = (msg.ID >= 0x780 && msg.ID <= 0x7EF) || msg.ID > 0x7FF;
+    const uint8_t pci_type = msg.data.u8[0] & 0xF0;
+    const bool is_first_frame = (pci_type == 0x10);
+    const bool is_single_frame = (pci_type == 0x00);
+    const uint8_t sid_offset = is_first_frame ? 2 : 1;
+    const uint8_t resp_sid = msg.data.u8[sid_offset];
+    if (udsBattery != nullptr && uds_response_id && (is_first_frame || is_single_frame) &&
+        (resp_sid == 0x61 || resp_sid == 0x62)) {
+      uint16_t target_pid = msg.data.u8[sid_offset + 1];
       if (resp_sid == 0x62) {
         // Is a UDS two-byte PID response (as opposed to a one-byte KWP2000 one).
-        target_pid = (target_pid << 8) | msg.data.u8[4];
+        target_pid = (target_pid << 8) | msg.data.u8[sid_offset + 2];
       }
 
-      // Now we keep hammering transmit_can up to 3000 times until we detect
-      // that it has sent a poll to the SID we're responding for.
+      // Now we keep hammering transmit_can until we detect that it has sent a
+      // poll for the PID we are responding for. Batteries with long scan lists
+      // (Zoe Gen2: ~190 DIDs, 10 retries x 200 ms each when nothing answers)
+      // need minutes of emulated time to reach a late PID, so the deadline is
+      // generous.
 
-      const size_t tx_start = tx_frames.size();
-      const unsigned long deadline = now + 30000;  // 30 s of emulated time
+      size_t i = tx_frames.size();
+      const unsigned long deadline = now + 600000;  // 600 s of emulated time
       bool poll_found = false;
       while (now < deadline && !poll_found) {
         now += 10;
         set_millis64(now);
         udsBattery->transmit_can(now);
 
-        // Go through all the frames that the battery has transmitted.
-        for (size_t i = tx_start; i < tx_frames.size(); i++) {
+        // Go through the frames transmitted since the last check.
+        for (; i < tx_frames.size(); i++) {
           const CAN_frame& req = tx_frames[i];
           const bool single_frame = (req.data.u8[0] == 0x02 || req.data.u8[0] == 0x03);
           const bool one_byte_match =
@@ -259,7 +273,7 @@ class PidDemuxTest : public CanLogTestFixture {
     const uint8_t balancing_bytes[] = {0xA5, 0x3C, 0x00, 0xFF, 0x81, 0x10, 0x42, 0x80, 0x01, 0x55, 0xAA, 0x0F};
     for (int i = 0; i < 96; i++) {
       bool expected = (balancing_bytes[i / 8] >> (i % 8)) & 1;
-      EXPECT_EQ(datalayer.battery.status.cell_balancing_status[i], expected) << "cell " << i;
+      EXPECT_EQ(datalayer.battery.status.cell_balancing_status.get(i), expected) << "cell " << i;
     }
 
     // 0x155 broadcast: SOC value bytes 4-5 are 0x2132 (8498 = 84.98%).
@@ -297,6 +311,30 @@ class NoCanErrorsTest : public CanLogTestFixture {
   }
 };
 
+// Check the CAC and the SOC that a real 3/Y pack (2024.8.9+ firmware, 0x3B2 mux 0x80) reports. The pack was on a
+// bench with the contactors open, so only the pack data of the log is checked.
+class TeslaCacTest : public CanLogTestFixture {
+ public:
+  explicit TeslaCacTest(fs::path path) : CanLogTestFixture(path) {}
+  void TestBody() override {
+    HandleFramesAndUpdateValues();
+
+    const auto& tesla = datalayer_extended.tesla;
+    EXPECT_TRUE(tesla.cac_valid);
+    EXPECT_EQ(tesla.cac_layout, 2);  // the 2024.8.9+ layout
+    // 0.1 Ah: 205.1 Ah average, 203.3 Ah minimum (brick 91), 207.5 Ah maximum (brick 2)
+    EXPECT_EQ(tesla.cac_avg_x10, 2051);
+    EXPECT_EQ(tesla.cac_min_x10, 2033);
+    EXPECT_EQ(tesla.cac_max_x10, 2075);
+    EXPECT_EQ(tesla.cac_min_brick_id, 91);
+    EXPECT_EQ(tesla.cac_max_brick_id, 2);
+
+    // SOC UI 85.3 % from 0x292, remaining energy 51.86 kWh from 0x352
+    EXPECT_EQ(datalayer.battery.status.real_soc, 8530);
+    EXPECT_EQ(datalayer.battery.status.remaining_capacity_Wh, 51860u);
+  }
+};
+
 void RegisterCanLogTests() {
   // The logs should be named as follows:
   //
@@ -313,6 +351,7 @@ void RegisterCanLogTests() {
   //     crc:  test that no frame is rejected, i.e. the driver's checksum calculation
   //     pid:  test that KWP2000 poll responses were demuxed into the datalayer
   //           exactly (cells, balancing, SOC, temperatures, metrics)
+  //     cac:  test that the CAC, SOC and remaining energy of a real Tesla 3/Y pack are decoded
 
   std::string directoryPath = TEST_CAN_LOG_DIR;
 
@@ -381,6 +420,11 @@ void RegisterCanLogTests() {
       testing::RegisterTest(
           "CanLogSafetyTests", ("TestPidDemux" + snake_case_to_camel_case(entry.path().stem().string())).c_str(),
           nullptr, nullptr, __FILE__, __LINE__, [=]() -> CanLogTestFixture* { return new PidDemuxTest(entry.path()); });
+    }
+    if (has_flag("cac")) {
+      testing::RegisterTest(
+          "CanLogSafetyTests", ("TestTeslaCac" + snake_case_to_camel_case(entry.path().stem().string())).c_str(),
+          nullptr, nullptr, __FILE__, __LINE__, [=]() -> CanLogTestFixture* { return new TeslaCacTest(entry.path()); });
     }
   }
 }

@@ -87,8 +87,8 @@ struct DATALAYER_INFO_BYDATTO3 {
   uint16_t SOC_estimated;
   /** SOC% raw battery value. Highprecision. Can be locked if pack is crashed */
   uint16_t SOC_highprec;
-  /** SOC% polled OBD2 value. Can be locked if pack is crashed */
-  uint16_t SOC_polled;
+  /** SOC% from 0x444, whole percent, as shown on the car dashboard */
+  uint16_t SOC_dashboard;
   /** Pack voltage from 0x438, deci-volts. Zero until the frame is received */
   uint16_t pack_voltage_dV;
   /** Insulation resistance from 0x43A, Ohm per volt. Multiply by pack voltage for Ohms. Zero is a valid fault reading */
@@ -96,7 +96,7 @@ struct DATALAYER_INFO_BYDATTO3 {
   /** True once a checksum-valid 0x43A has been seen */
   bool insulation_valid;
   uint16_t chargePower;
-  uint16_t charge_times;
+  uint16_t charge_sessions_started;
   /** BMS charge time remaining (0x445) in hours and minutes, 0xFF = not available */
   uint8_t charge_time_remaining_h;
   uint8_t charge_time_remaining_min;
@@ -105,7 +105,7 @@ struct DATALAYER_INFO_BYDATTO3 {
   uint16_t total_discharged_ah;
   uint16_t total_charged_kwh;
   uint16_t total_discharged_kwh;
-  uint16_t times_full_power;
+  uint16_t full_charges_completed;
   uint16_t BMS_capacity_original_calibration;
   uint16_t BMC_SOC_original_calibration;
   uint16_t BMS_capacity_current_calibration;
@@ -119,7 +119,10 @@ struct DATALAYER_INFO_BYDATTO3 {
   /** All the temperature sensors inside the battery pack*/
   int16_t battery_temperatures[12];
 
-  uint8_t discharge_status;
+  /** 0x344 byte 2 low nibble: F none, 0 ready, 1 charging, 2 finished, 4 aborted */
+  uint8_t bms_charge_state;
+  /** 0x344 b5 bits 2-4: 0 none, 1 AC, 2 DC, 3 AC+DC, 4 V2L, 5 OBC CC */
+  uint8_t charge_gun;
   uint8_t BMS_min_cell_voltage_number;
   uint8_t BMS_min_temp_module_number;
   uint8_t BMS_max_cell_voltage_number;
@@ -139,10 +142,6 @@ struct DATALAYER_INFO_BYDATTO3 {
   uint8_t contactor_feedback;
   /** Decoded from contactor_feedback bit7 */
   bool contactor_main_closed;
-  /** Decoded from contactor_feedback bit6 */
-  bool contactor_precharging;
-  /** Decoded from contactor_feedback bit2 */
-  bool contactor_hv_active;
   /** Decoded from contactor_feedback bit1, set in idle/drive states, clear while charging */
   bool contactor_drive_flag;
   /** Decoded from contactor_feedback bit0, set while AC charging */
@@ -192,6 +191,10 @@ struct DATALAYER_INFO_BYDATTO3 {
   uint8_t balancing_state;
   /** Minutes left of the hold */
   uint16_t balancing_remaining_min;
+  /** Lift the SOC window top after this many days without a termination, 0 off */
+  uint8_t full_charge_every_days;
+  /** Hours counted since the last termination, restarts on reboot */
+  uint16_t full_charge_hours;
 
   // DTC readout (UDS 0x19 0x02). Codes packed as raw 3 bytes in a uint32, rendered to string in HTML.
   bool dtc_read_in_progress;
@@ -205,6 +208,7 @@ struct DATALAYER_INFO_BYDATTO3 {
   bool iso_measurement_active;  // 0x35E b0 bit0x80: isolation measurement running
   bool iso_status_valid;        // fresh 0x35E seen (else status unknown)
   uint8_t iso_command_status;   // 0 idle, 1 running, 2 accepted, 3 rejected, 4 no reply
+  bool dm_pack;                 // latched from 0x344, DM packs refuse the routine
 };
 
 struct DATALAYER_INFO_CELLPOWER {
@@ -336,42 +340,6 @@ struct DATALAYER_INFO_GEELY_GEOMETRY_C {
   uint16_t unknown8;
 };
 
-struct DATALAYER_INFO_KIA64FD {
-  /** SOC reported by the BMS, 1000 = 100.0% */
-  uint16_t SOC_BMS;
-  /** SOC shown on the vehicle display, 1000 = 100.0% */
-  uint16_t SOC_Display;
-  /** SOC estimated from the lowest cell voltage, 10000 = 100.00% */
-  uint16_t SOC_estimated_lowest;
-  /** SOC estimated from the highest cell voltage, 10000 = 100.00% */
-  uint16_t SOC_estimated_highest;
-  /** State of health reported by the BMS, 1000 = 100.0% */
-  uint16_t batterySOH;
-  /** Voltage measured on the inverter side of the contactors, in V */
-  uint16_t inverterVoltage;
-
-  /** Charge power the BMS permits, in kW*100 */
-  int16_t allowedChargePower;
-  /** Discharge power the BMS permits, in kW*100 */
-  int16_t allowedDischargePower;
-  /** 12V auxiliary battery voltage, 120 = 12.0V */
-  int16_t leadAcidBatteryVoltage;
-
-  /** Coolant temperature at the pack inlet, in degrees C */
-  int8_t temperature_water_inlet;
-  /** Battery heater temperature, in degrees C */
-  int8_t heatertemp;
-
-  /** Index of the cell holding the highest voltage */
-  uint8_t CellVmaxNo;
-  /** Index of the cell holding the lowest voltage */
-  uint8_t CellVminNo;
-  /** BMS operating mode */
-  uint8_t batteryManagementMode;
-  /** BMS ignition signal state */
-  uint8_t BMS_ign;
-};
-
 struct DATALAYER_INFO_RIVIAN {
   uint16_t pre_contactor_voltage;
   uint16_t main_contactor_voltage;
@@ -398,6 +366,8 @@ struct DATALAYER_INFO_RIVIAN {
   bool operation_limit_violation_warning;
 };
 
+// Detail page fields are raw (see DETAIL PAGE RULE in TESLA-HTML.cpp), the calculated values have their own fields
+// (nominal_full_held_x10, battery_beginning_of_life, cac_*_x10 ...).
 struct DATALAYER_INFO_TESLA {
   // Alert-matrix (DTC) fault flags for the Faults web page; mapped from tesla-m3-pack-findings (fw 2019.20.4.2)
   bool BMS_alertMatrixActive[100];
@@ -422,6 +392,8 @@ struct DATALAYER_INFO_TESLA {
   uint32_t BMS_max_voltage;
   uint32_t battery_max_charge_current;
   uint32_t battery_max_discharge_current;
+  // Raw, 0.1 %, 1023 = not available / not received yet (the detail page shows N/A). SOC UI is the live value, not the
+  // held one that is used for real_soc. The brick SOC is validated for the calculated values only (see TESLA-HTML.cpp).
   uint32_t battery_soc_min;
   uint32_t battery_soc_max;
   uint32_t battery_soc_ave;
@@ -449,6 +421,24 @@ struct DATALAYER_INFO_TESLA {
   uint16_t battery_expected_energy_remaining_m1;
   uint16_t battery_BrickVoltageMax;
   uint16_t battery_BrickVoltageMin;
+  // CAC (calculated capacity), 0.1 Ah. 3/Y: 0x3B2 mux 0. Legacy S/X: avg/min/max from 0x7E2 mux 0, no brick IDs.
+  uint16_t cac_avg_x10;
+  uint16_t cac_min_x10;
+  uint16_t cac_max_x10;
+  // Detail page: the raw CAC as decoded, no checks. 0.1 Ah, all ones = not available, N/A until the frame was received.
+  // 3/Y 0x3B2 mux 0: [0] = 2022 layout, [1] = 2024.8.9+ layout (each frame is decoded in both). S/X 0x7E2 page 0: [0].
+  bool cac_raw_seen[2];            // same index as cac_raw_*
+  bool nominal_remaining_seen;     // 3/Y 0x352 without mux
+  bool nominal_remaining_m0_seen;  // 3/Y 0x352 mux 0
+  bool bol_0x292_seen;
+  bool bol_0x392_seen;
+  bool nominal_0x382_seen;  // S/X
+  uint16_t cac_raw_avg_x10[2];
+  uint16_t cac_raw_min_x10[2];
+  uint16_t cac_raw_max_x10[2];
+  uint16_t battery_soc_min_0x302;  // S/X 0x302 SOC min, raw 0.1 %, 1023 = not available / not received yet
+  uint16_t
+      nominal_full_held_x10;  // Nominal full pack energy, 0.1 kWh, held 30 s, 0 = unknown: calculated values and SOH
   uint16_t HVP_hvp1v5Ref;
   int16_t HVP_shuntCurrentDebug;
   int16_t PCS_dcdcTemp;
@@ -532,10 +522,21 @@ struct DATALAYER_INFO_TESLA {
   uint8_t BMS_info_assemblyId;
   uint8_t BMS_info_platformType;
   uint8_t BMS_info_bootUdsProtoVersion;
-  uint8_t battery_beginning_of_life;
+  uint16_t
+      battery_beginning_of_life;  // Calculated values: capacity when new, 0.1 kWh, 0x392 mux 1 else 0x292, 0 = unavailable
+  uint16_t bol_0x292_x10;         // Raw capacity when new of 0x292 and 0x392 mux 1, 0.1 kWh, 0 / 1023 = N/A
+  uint16_t bol_0x392_x10;
+  bool temperature_seen;    // 0x332 mux 0 received; false = the calculated values show N/A
+  bool soh_estimate_known;  // SOH estimate calculated; false = 99 % sent, pages say unknown
   uint8_t battery_battTempPct;
   uint8_t battery_BrickVoltageMaxNum;
   uint8_t battery_BrickVoltageMinNum;
+  uint8_t cac_min_brick_id;         // 1 based
+  uint8_t cac_max_brick_id;         // 1 based
+  uint8_t cac_raw_min_brick_id[2];  // 1 based (raw + 1), 3/Y only, same layout index as cac_raw_*
+  uint8_t cac_raw_max_brick_id[2];
+  uint8_t cac_layout;  // 0 = unknown, 1 = 2022 layout, 2 = 2024.8.9+ layout (3/Y)
+  bool cac_valid;      // A CAC frame has been decoded
   uint8_t battery_BrickTempMaxNum;
   uint8_t battery_BrickTempMinNum;
   uint8_t battery_BrickModelTMax;
@@ -875,52 +876,6 @@ struct DATALAYER_INFO_GEELY_SEA {
   bool UserRequestCrashReset;
 };
 
-struct DATALAYER_INFO_ZOE_PH2 {
-  uint32_t battery_slave_failures;
-  /** uint16_t */
-  uint16_t battery_soc;
-  uint16_t battery_usable_soc;
-  uint16_t battery_soh;
-  uint16_t battery_pack_voltage;
-  uint16_t battery_max_cell_voltage;
-  uint16_t battery_min_cell_voltage;
-  uint16_t battery_12v;
-  uint16_t battery_avg_temp;
-  uint16_t battery_min_temp;
-  uint16_t battery_max_temp;
-  uint16_t battery_max_power;
-  uint16_t battery_interlock;
-  uint16_t battery_kwh;
-  uint16_t battery_current;
-  uint16_t battery_current_offset;
-  uint16_t battery_max_generated;
-  uint16_t battery_max_available;
-  uint16_t battery_current_voltage;
-  uint16_t battery_charging_status;
-  uint16_t battery_remaining_charge;
-  uint16_t battery_balance_capacity_total;
-  uint16_t battery_balance_time_total;
-  uint16_t battery_balance_capacity_sleep;
-  uint16_t battery_balance_time_sleep;
-  uint16_t battery_balance_capacity_wake;
-  uint16_t battery_balance_time_wake;
-  uint16_t battery_bms_state;
-  uint16_t battery_energy_complete;
-  uint16_t battery_energy_partial;
-  uint16_t battery_mileage;
-  uint16_t battery_fan_speed;
-  uint16_t battery_fan_period;
-  uint16_t battery_fan_control;
-  uint16_t battery_fan_duty;
-  uint16_t battery_temporisation;
-  uint16_t battery_time;
-  uint16_t battery_pack_time;
-  uint16_t battery_soc_min;
-  uint16_t battery_soc_max;
-  /** User requesting NVROL reset via WebUI*/
-  bool UserRequestNVROLReset;
-};
-
 class DataLayerExtended {
  public:
   union {
@@ -935,10 +890,6 @@ class DataLayerExtended {
 #endif  // SMALL_FLASH_DEVICE
     DATALAYER_INFO_FORD_MACH_E fordMachE;
     DATALAYER_INFO_GEELY_GEOMETRY_C geometryC;
-    struct {
-      DATALAYER_INFO_KIA64FD Kia64FD;
-      DATALAYER_INFO_KIA64FD Kia64FD_2;
-    };
     struct {
       DATALAYER_INFO_TESLA tesla;
       DATALAYER_INFO_TESLA tesla_2;
@@ -958,8 +909,6 @@ class DataLayerExtended {
   DATALAYER_INFO_RIVIAN rivian;
   DATALAYER_INFO_VOLVO_POLESTAR VolvoPolestar;
   DATALAYER_INFO_GEELY_SEA GeelySEA;
-  DATALAYER_INFO_ZOE_PH2 zoePH2;
-  DATALAYER_INFO_ZOE_PH2 zoePH2_2;
 
   DataLayerExtended() {
     memset(this, 0, sizeof(DataLayerExtended));
@@ -969,7 +918,7 @@ class DataLayerExtended {
     auto initBydAtto3 = [](auto& data) {
       data.calibrationTargetSOC = 100;
       data.calibrationTargetAH = 150;
-      data.discharge_status = 14;
+      data.bms_charge_state = 0x0F;
       data.charge_time_remaining_h = 0xFF;
       data.charge_time_remaining_min = 0xFF;
       data.auto_calibrate_soc_enabled = true;
