@@ -1399,3 +1399,252 @@ TEST_F(GivEnergyLvGuard, VerifyMeasuresAFullMinuteOnceTheDataIsBack) {
   run(inverter, port, 1);
   EXPECT_EQ(inverter.guard(), Guard::Normal);
 }
+
+// ---- Restart request (HR4 = 1) ----
+//
+// A real GivEnergy BMS resets about 20 s after the inverter writes HR4 = 1, answering polls as
+// usual until then, and an HR4 = 0 write cancels it. A G3 sends about ten such writes over 2.4 s.
+// The module restarts the emulator after the same delay if the user accepts restarts from the
+// inverter, and otherwise raises the declined event. Nothing in the replies changes before that.
+
+namespace {
+
+class GivEnergyLvRestart : public GivEnergyLvInverter {
+ protected:
+  void SetUp() override {
+    GivEnergyLvInverter::SetUp();
+    init_events();
+    reset_all_events();
+    user_selected_accept_inverter_reboot = false;
+    datalayer.aggregate.voltage_dV = 520;
+    datalayer.aggregate.reported_soc = 5000;
+  }
+  void TearDown() override {
+    user_selected_accept_inverter_reboot = false;
+    reset_all_events();
+  }
+
+  static std::vector<uint8_t> write(uint8_t device, uint16_t reg, uint16_t value) {
+    return with_crc({device, 0x06, static_cast<uint8_t>(reg >> 8), static_cast<uint8_t>(reg & 0xFF),
+                     static_cast<uint8_t>(value >> 8), static_cast<uint8_t>(value & 0xFF)});
+  }
+
+  // Feeds a request and returns whatever goes out after the turnaround. Takes 240 ms, a G3's
+  // poll cycle.
+  static std::vector<uint8_t> exchange(GivEnergyLvRs485Inverter& inverter, FakeSerial& port,
+                                       const std::vector<uint8_t>& request) {
+    port.tx.clear();
+    port.feed(request);
+    inverter.receive();
+    set_millis64(millis64() + 75);
+    inverter.receive();
+    set_millis64(millis64() + 165);
+    return port.tx;
+  }
+
+  // A G3's restart request: ten HR4 = 1 writes over 2.4 s, with the module's 1 s update running.
+  static void burst(GivEnergyLvRs485Inverter& inverter, FakeSerial& port, uint8_t device = 1) {
+    for (int i = 0; i < 10; i++) {
+      exchange(inverter, port, write(device, 4, 1));
+      if (i % 4 == 3) {
+        inverter.update_values();
+      }
+    }
+  }
+
+  // Polls and updates once a second for the given number of seconds.
+  static void run_s(GivEnergyLvRs485Inverter& inverter, FakeSerial& port, int seconds) {
+    for (int s = 0; s < seconds; s++) {
+      exchange(inverter, port, kHrPoll);
+      set_millis64(millis64() + 760);
+      inverter.update_values();
+    }
+  }
+
+  static uint16_t hr(const std::vector<uint8_t>& reply, int index) {
+    return static_cast<uint16_t>(reply[3 + 2 * index] << 8 | reply[3 + 2 * index + 1]);
+  }
+
+  // The limits and alarms of a normal mid-charge pack, in the snapshot and on the wire.
+  static void expect_unchanged(GivEnergyLvRs485Inverter& inverter, FakeSerial& port) {
+    EXPECT_EQ(inverter.snapshot().limit_cA, 9000);
+    EXPECT_EQ(inverter.snapshot().charge_limit_cA, 8000);
+    EXPECT_EQ(inverter.snapshot().discharge_limit_cA, 8000);
+    EXPECT_EQ(inverter.snapshot().alarms, 0u);
+    const auto reply = exchange(inverter, port, kHrPoll);
+    ASSERT_EQ(reply.size(), 61u);
+    EXPECT_EQ(hr(reply, 20), 0u);
+    EXPECT_EQ(hr(reply, 25), 9000u);
+    EXPECT_EQ(hr(reply, 26), 8000u);
+    EXPECT_EQ(hr(reply, 27), 8000u);
+    EXPECT_EQ(datalayer.system.status.system_status, ACTIVE);
+  }
+
+  static const EVENTS_STRUCT_TYPE& event(EVENTS_ENUM_TYPE e) { return *get_event_pointer(e); }
+};
+
+}  // namespace
+
+TEST_F(GivEnergyLvRestart, OtherWritesChangeNothing) {
+  user_selected_accept_inverter_reboot = true;
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  for (const auto& w : {write(1, 4, 0), write(1, 4, 2), write(1, 4, 0xFFFF), write(1, 1, 1), write(1, 2, 1),
+                        write(1, 3, 1), write(1, 5, 1), write(7, 4, 1)}) {
+    exchange(inverter, port, w);
+    inverter.update_values();
+  }
+  run_s(inverter, port, 30);
+  EXPECT_FALSE(inverter.restart_pending());
+  EXPECT_EQ(inverter.restarts_requested(), 0u);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).state, EVENT_STATE_INACTIVE);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).state, EVENT_STATE_INACTIVE);
+  expect_unchanged(inverter, port);
+}
+
+TEST_F(GivEnergyLvRestart, DeclinedRaisesTheEventOncePerBurstAndChangesNothing) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  burst(inverter, port);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).state, EVENT_STATE_ACTIVE);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).occurences, 1u);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).data, 1);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).state, EVENT_STATE_INACTIVE);
+  EXPECT_FALSE(inverter.restart_pending());
+  expect_unchanged(inverter, port);
+
+  run_s(inverter, port, 60);
+  EXPECT_EQ(inverter.restarts_requested(), 0u);
+  expect_unchanged(inverter, port);
+}
+
+TEST_F(GivEnergyLvRestart, DeclinedIsRaisedAgainOnlyAfterAMinuteWithoutARequest) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  burst(inverter, port);
+  run_s(inverter, port, 30);
+  burst(inverter, port);  // within a minute of the last write: still the same request
+  run_s(inverter, port, 57);
+  burst(inverter, port);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).occurences, 1u);
+
+  run_s(inverter, port, 61);
+  burst(inverter, port);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).occurences, 2u);
+  EXPECT_EQ(inverter.restarts_requested(), 0u);
+}
+
+TEST_F(GivEnergyLvRestart, AcceptedRestartsTwentySecondsAfterTheFirstWrite) {
+  user_selected_accept_inverter_reboot = true;
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  const uint64_t first_write_ms = millis64();
+  burst(inverter, port);
+  EXPECT_TRUE(inverter.restart_pending());
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).state, EVENT_STATE_ACTIVE);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).occurences, 1u);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).data, 1);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).state, EVENT_STATE_INACTIVE);
+
+  // Polls are answered as normal until the restart.
+  while (millis64() + 1240 < first_write_ms + 20000) {
+    run_s(inverter, port, 1);
+    ASSERT_EQ(inverter.restarts_requested(), 0u) << "restarted " << (millis64() - first_write_ms) << " ms in";
+    expect_unchanged(inverter, port);
+  }
+  set_millis64(first_write_ms + 19999);
+  inverter.update_values();
+  EXPECT_EQ(inverter.restarts_requested(), 0u);
+  // Twenty seconds after the first write of the burst, not the last.
+  set_millis64(first_write_ms + 20000);
+  inverter.update_values();
+  EXPECT_EQ(inverter.restarts_requested(), 1u);
+  EXPECT_FALSE(inverter.restart_pending());
+
+  // The restart takes a few seconds; nothing in the meantime asks for another.
+  burst(inverter, port);
+  run_s(inverter, port, 60);
+  EXPECT_EQ(inverter.restarts_requested(), 1u);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).occurences, 1u);
+}
+
+TEST_F(GivEnergyLvRestart, Hr4ZeroCancelsAPendingRestart) {
+  user_selected_accept_inverter_reboot = true;
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  burst(inverter, port);
+  run_s(inverter, port, 10);
+  ASSERT_TRUE(inverter.restart_pending());
+  exchange(inverter, port, write(1, 4, 0));
+  EXPECT_FALSE(inverter.restart_pending());
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).state, EVENT_STATE_INACTIVE);
+  run_s(inverter, port, 60);
+  EXPECT_EQ(inverter.restarts_requested(), 0u);
+  expect_unchanged(inverter, port);
+
+  // A later request starts afresh.
+  const uint64_t first_write_ms = millis64();
+  burst(inverter, port);
+  set_millis64(first_write_ms + 19999);
+  inverter.update_values();
+  EXPECT_EQ(inverter.restarts_requested(), 0u);
+  set_millis64(first_write_ms + 20000);
+  inverter.update_values();
+  EXPECT_EQ(inverter.restarts_requested(), 1u);
+}
+
+TEST_F(GivEnergyLvRestart, AWriteToAnySlotUpToSixAsksForIt) {
+  user_selected_accept_inverter_reboot = true;
+  for (uint8_t device = 0; device <= 6; device++) {
+    reset_all_events();
+    FakeSerial port;
+    GivEnergyLvRs485Inverter inverter(port);
+    inverter.update_values();
+    exchange(inverter, port, write(device, 4, 1));
+    EXPECT_TRUE(inverter.restart_pending()) << "device " << static_cast<int>(device);
+    EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).data, device);
+  }
+
+  reset_all_events();
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  exchange(inverter, port, write(7, 4, 1));
+  EXPECT_FALSE(inverter.restart_pending());
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_ACCEPTED).state, EVENT_STATE_INACTIVE);
+}
+
+TEST_F(GivEnergyLvRestart, AWriteToAnotherSlotIsDeclinedToo) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  exchange(inverter, port, write(6, 4, 1));
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).state, EVENT_STATE_ACTIVE);
+  EXPECT_EQ(event(EVENT_INVERTER_REBOOT_DECLINED).data, 6);
+}
+
+TEST_F(GivEnergyLvRestart, ActsBeforeTheBatteryHasReported) {
+  user_selected_accept_inverter_reboot = true;
+  datalayer.battery.status.voltage_dV = 0;
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  const uint64_t first_write_ms = millis64();
+  EXPECT_TRUE(exchange(inverter, port, write(1, 4, 1)).empty()) << "replied before the battery had reported";
+  EXPECT_TRUE(inverter.restart_pending());
+  set_millis64(first_write_ms + 20000);
+  inverter.update_values();
+  EXPECT_EQ(inverter.restarts_requested(), 1u);
+}
+
+TEST(GivEnergyLvEvents, AnAcceptedRestartIsInfo) {
+  init_events();
+  reset_all_events();
+  EXPECT_STREQ(get_event_level_string(EVENT_INVERTER_REBOOT_ACCEPTED), "INFO");
+  EXPECT_STREQ(get_event_level_string(EVENT_INVERTER_REBOOT_DECLINED), "WARNING");
+}

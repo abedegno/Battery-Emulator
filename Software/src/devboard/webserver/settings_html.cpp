@@ -1844,6 +1844,12 @@ String qnhck_zero_text(uint16_t zero_mV) {
       display: contents;
     }
 
+    form .if-invreboot { display: none; }
+    form[data-inverter="3"] .if-invreboot,
+    form[data-inverter="26"] .if-invreboot {
+      display: contents;
+    }
+
     form .if-pylon { display: none; }
     form[data-battery="22"] .if-pylon,
     form[data-inverter="10"] .if-pylon {
@@ -2304,10 +2310,12 @@ String qnhck_zero_text(uint16_t zero_mV) {
         <input type='checkbox' name='DEYEBYD' value='on' %DEYEBYD% />
         </div>
 
-        <div class="if-bydmodbus">
+        <div class="if-invreboot">
         <label>Accept reboot command from inverter: </label>
         <input type='checkbox' name='INVACCREB' value='on' %INVACCREB% />
+        </div>
 
+        <div class="if-bydmodbus">
         <label>Fronius Primo, 450V maxvoltage cap: </label>
         <input type='checkbox' name='PRIMOGEN24' value='on' %PRIMOGEN24% />
 

@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cstring>
 
+#include "../communication/contactorcontrol/comm_contactorcontrol.h"
 #include "../communication/rs485/comm_rs485.h"
 #include "../datalayer/datalayer.h"
 #include "../devboard/hal/hal.h"
+#include "../devboard/safety/safety.h"
 #include "../devboard/utils/events.h"
 #include "../devboard/utils/logging.h"
 #include "INVERTERS.h"
@@ -199,6 +201,11 @@ void GivEnergyLvRs485Inverter::update_values() {
   apply_guard(snapshot_);
   apply_taper_latch(snapshot_);
 
+  if (restart_pending_ && millis64() - restart_since_ms_ >= kRestartDelayMs) {
+    restart_pending_ = false;
+    restart_emulator();
+  }
+
   if (incoming_message_counter_ > 0) {
     incoming_message_counter_--;
   }
@@ -255,9 +262,14 @@ void GivEnergyLvRs485Inverter::handle_request(uint32_t now_ms) {
     set_event(EVENT_MODBUS_INVERTER_DETECTED, 1);
   }
   if (rx_[1] == 6) {
-    logging.printf("GivEnergy: inverter wrote %u to register %u of device %u\n",
-                   static_cast<unsigned>(rx_[4] << 8 | rx_[5]), static_cast<unsigned>(rx_[2] << 8 | rx_[3]),
-                   static_cast<unsigned>(rx_[0]));
+    const uint16_t reg = static_cast<uint16_t>(rx_[2] << 8 | rx_[3]);
+    const uint16_t value = static_cast<uint16_t>(rx_[4] << 8 | rx_[5]);
+    logging.printf("GivEnergy: inverter wrote %u to register %u of device %u\n", static_cast<unsigned>(value),
+                   static_cast<unsigned>(reg), static_cast<unsigned>(rx_[0]));
+    // Acted on even before the module is ready: a restart then is harmless.
+    if (rx_[0] <= kRestartMaxDevice && reg == kRestartRegister) {
+      handle_restart_write(rx_[0], value);
+    }
   }
   if (!ready_) {
     return;  // no real snapshot yet: stay silent rather than answer with placeholder values
@@ -361,6 +373,55 @@ void GivEnergyLvRs485Inverter::update_guard(const givenergy_lv::Snapshot& advert
       }
       break;
   }
+}
+
+// A GivEnergy inverter writes HR4 = 1 when its own HR201 has been set from outside (the app, the
+// cloud or its RS485 port). It sends about ten such writes over 2.4 s in place of its polls, then
+// polls again. A real GivEnergy BMS (3020 and 3022) saves its state and, about 20 s later, does an
+// ordinary reset: it keeps answering polls with its usual values until then, boots normally, and
+// cancels the reset if HR4 = 0 arrives first. So the module restarts the emulator after the same
+// delay if the user accepts restarts from the inverter, and otherwise only reports the request.
+// Nothing in the replies changes before the restart itself, which pauses charge and discharge for
+// its last few seconds like any other restart of the emulator.
+void GivEnergyLvRs485Inverter::handle_restart_write(uint8_t device, uint16_t value) {
+  if (value == 0) {
+    if (restart_pending_) {
+      logging.println("GivEnergy: inverter cancelled its restart request (HR4 = 0)");
+      restart_pending_ = false;
+      clear_event(EVENT_INVERTER_REBOOT_ACCEPTED);
+    }
+    return;
+  }
+  if (value != 1 || restart_pending_ || restarts_requested_ > 0) {
+    return;  // the rest of a burst, or a restart already under way
+  }
+  const uint64_t now_ms = millis64();
+  if (!user_selected_accept_inverter_reboot) {
+    if (!declined_ || now_ms - last_declined_ms_ >= kRestartBurstGapMs) {
+      // Raised as an event rather than only logged, as in BYD-MODBUS: the inverter believes it
+      // asked for something that never happened.
+      set_event(EVENT_INVERTER_REBOOT_DECLINED, device);
+    }
+    declined_ = true;
+    last_declined_ms_ = now_ms;
+    return;
+  }
+  logging.printf("GivEnergy: inverter asked the battery to restart (HR4 = 1); restarting in %u s\n",
+                 static_cast<unsigned>(kRestartDelayMs / 1000));
+  set_event(EVENT_INVERTER_REBOOT_ACCEPTED, device);
+  restart_pending_ = true;
+  restart_since_ms_ = now_ms;
+}
+
+void GivEnergyLvRs485Inverter::restart_emulator() {
+  restarts_requested_++;
+  LOG_SET_NEXT_SEVERITY(5);  // notice
+  logging.println("The emulator is restarting as requested by the inverter");
+#ifndef UNIT_TEST
+  // Not in the host tests, which check that the restart was asked for without restarting.
+  hold_pins_across_reset();
+  graceful_restart();  // Pauses charge/discharge and opens contactors before the restart
+#endif
 }
 
 void GivEnergyLvRs485Inverter::lock_out(uint8_t trigger, uint64_t now_ms) {

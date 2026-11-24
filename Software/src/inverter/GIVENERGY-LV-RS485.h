@@ -22,6 +22,10 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   enum class Guard : uint8_t { Normal, EndingBoth, EndingFull, Verify, Lockout };
   Guard guard() const { return guard_; }
   const givenergy_lv::Snapshot& snapshot() const { return snapshot_; }
+  // Whether an inverter-requested restart is counting down, and how many restarts the module has
+  // started (see restart_emulator()). Public for the unit tests.
+  bool restart_pending() const { return restart_pending_; }
+  uint32_t restarts_requested() const { return restarts_requested_; }
 
  private:
   int baud_rate() override { return 9600; }
@@ -34,6 +38,8 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   void lock_out(uint8_t trigger, uint64_t now_ms);
   void apply_guard(givenergy_lv::Snapshot& s) const;
   void apply_taper_latch(givenergy_lv::Snapshot& s);
+  void handle_restart_write(uint8_t device, uint16_t value);
+  void restart_emulator();
 
   // Wait before replying. Modbus RTU only needs 3.5 character times (3.6 ms at 9600), but a G3
   // isn't ready to receive that soon after its own request: an emulator on a G3 failed at every
@@ -44,6 +50,15 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   static constexpr uint32_t kTurnaroundMs = 75;
   // A frame identical to the write echo just sent, this soon after, is the transceiver hearing itself.
   static constexpr uint32_t kEchoWindowMs = 50;
+  // The holding register a GivEnergy inverter writes 1 to when it wants the battery to restart. A
+  // real battery takes the write addressed to any device up to 6.
+  static constexpr uint16_t kRestartRegister = 4;
+  static constexpr uint8_t kRestartMaxDevice = 6;
+  // A real GivEnergy BMS (3020 and 3022) resets 1000 passes of its 20 ms task after the write.
+  static constexpr uint64_t kRestartDelayMs = 20000;
+  // A G3 sends about ten restart writes over 2.4 s. A declined request is reported again only
+  // after this long without one, so one burst raises the event once.
+  static constexpr uint64_t kRestartBurstGapMs = 60000;
   // As PYLON-LV-RS485: 12 updates of 1 s (about 12 s) without a request raise the missing event.
   static constexpr uint8_t RS485_HEALTHY = 12;
 
@@ -81,6 +96,13 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   // restart clears it, which is fine: if the pack is still full, charging pushes the highest cell
   // back to kTaperEnd_mV within minutes and the latch re-engages.
   bool taper_latched_ = false;
+  // An inverter-requested restart (see handle_restart_write()). restart_since_ms_ is when the
+  // first write of the request arrived; last_declined_ms_ is when the last declined one did.
+  bool restart_pending_ = false;
+  uint64_t restart_since_ms_ = 0;
+  uint32_t restarts_requested_ = 0;
+  bool declined_ = false;
+  uint64_t last_declined_ms_ = 0;
 };
 
 #endif
