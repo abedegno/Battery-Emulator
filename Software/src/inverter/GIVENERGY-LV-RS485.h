@@ -29,9 +29,8 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
 
  private:
   int baud_rate() override { return 9600; }
-  bool is_echo(uint32_t now_ms) const;
   void handle_request(uint32_t now_ms);
-  void send_reply(uint32_t now_ms);
+  void send_reply();
   void update_guard(const givenergy_lv::Snapshot& advertised, uint64_t now_ms);
   uint8_t tripped_trigger(const givenergy_lv::Snapshot& advertised, uint64_t now_ms, bool verifying);
   void enter_guard(Guard state, uint64_t now_ms);
@@ -48,8 +47,6 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   // well clear of the limit. Even a 61-byte HR
   // reply then ends well inside the G3's 240 ms poll cycle.
   static constexpr uint32_t kTurnaroundMs = 75;
-  // A frame identical to the write echo just sent, this soon after, is the transceiver hearing itself.
-  static constexpr uint32_t kEchoWindowMs = 50;
   // The holding register a GivEnergy inverter writes 1 to when it wants the battery to restart. A
   // real battery takes the write addressed to any device up to 6.
   static constexpr uint16_t kRestartRegister = 4;
@@ -69,11 +66,6 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   uint8_t reply_[givenergy_lv::kMaxReplyLen] = {};
   size_t reply_len_ = 0;
   uint32_t request_ms_ = 0;
-  uint8_t sent_[givenergy_lv::kRequestLen] = {};
-  bool sent_write_echo_ = false;
-  // Deadline past which a frame identical to our last write echo is a genuine retry, not the
-  // transceiver hearing its own transmission: the end of that transmission plus kEchoWindowMs.
-  uint32_t echo_until_ms_ = 0;
   uint8_t incoming_message_counter_ = RS485_HEALTHY;
   bool inverter_detected_ = false;
   // Set once update_values() has seen a real pack voltage from the battery module. Until then,

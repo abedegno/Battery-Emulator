@@ -130,49 +130,51 @@ TEST_F(GivEnergyLvInverter, AssemblesARequestSplitAcrossTwoReceiveCalls) {
   EXPECT_EQ(port.tx.size(), 61u);
 }
 
-TEST_F(GivEnergyLvInverter, IgnoresItsOwnWriteEchoButAnswersALaterRetry) {
+// A write gets the battery's 5-byte reply, not an echo. Hearing that reply back can't look like a
+// request, so the same write arriving again, however soon, is answered again.
+TEST_F(GivEnergyLvInverter, AnswersAWriteAndARepeatOfItWithTheFiveByteReply) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
   inverter.update_values();
   const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
+  const std::vector<uint8_t> reply = {0x01, 0x06, 0x00, 0x23, 0xA0};
   port.feed(write);
   inverter.receive();
   set_millis64(1075);
   inverter.receive();
-  ASSERT_EQ(port.tx, write);
+  ASSERT_EQ(port.tx, reply);
 
-  port.feed(write);  // the transceiver hearing our own reply
+  port.feed(reply);  // the transceiver hearing our own reply
   set_millis64(1081);
   inverter.receive();
-  set_millis64(1091);
+  set_millis64(1160);
   inverter.receive();
-  EXPECT_EQ(port.tx.size(), 8u) << "answered its own echo";
+  EXPECT_EQ(port.tx.size(), 5u) << "answered its own reply";
 
-  set_millis64(1300);  // the inverter genuinely writing again
-  port.feed(write);
+  port.feed(write);  // the inverter writing again straight away
+  set_millis64(1161);
   inverter.receive();
-  set_millis64(1375);
+  set_millis64(1236);
   inverter.receive();
-  EXPECT_EQ(port.tx.size(), 16u);
+  EXPECT_EQ(port.tx.size(), 10u);
 }
 
-TEST_F(GivEnergyLvInverter, IgnoresAnEchoThatArrivesInTheSameCallAsTheSend) {
+TEST_F(GivEnergyLvInverter, FindsTheNextPollAfterHearingItsOwnWriteReply) {
   FakeSerial port;
   GivEnergyLvRs485Inverter inverter(port);
   inverter.update_values();
-  const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
-  port.feed(write);
+  port.feed(with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01}));
   inverter.receive();
 
   set_millis64(1075);
-  port.feed(write);  // the echo is already on the wire before we send our reply this call
+  port.feed({0x01, 0x06, 0x00, 0x23, 0xA0});  // already on the wire before we send our reply this call
+  port.feed(kHrPoll);
   inverter.receive();
-
-  set_millis64(1081);
+  set_millis64(1150);
   inverter.receive();
-  set_millis64(1091);
-  inverter.receive();
-  EXPECT_EQ(port.tx.size(), 8u) << "answered its own echo";
+  ASSERT_EQ(port.tx.size(), 5u + 61u);
+  EXPECT_EQ(port.tx[5], 0x01);
+  EXPECT_EQ(port.tx[6], 0x03);
 }
 
 TEST_F(GivEnergyLvInverter, ReplyUsesTheDatalayerFromTheLastUpdate) {

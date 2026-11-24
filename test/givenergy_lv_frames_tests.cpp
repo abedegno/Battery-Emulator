@@ -184,10 +184,20 @@ TEST(GivEnergyLvFrames, NegativeTemperaturesAreTwosComplement) {
   EXPECT_EQ(block3[4 + 35], 0xCC);
 }
 
-TEST(GivEnergyLvFrames, WritesAreEchoed) {
-  // The inverter retries a write until it sees the echo, stalling the bus.
-  const std::vector<uint8_t> write = with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01});
-  EXPECT_EQ(reply_to(write, captured_snapshot()), write);
+TEST(GivEnergyLvFrames, WritesGetTheBatterysFiveByteReply) {
+  // A GivEnergy BMS on firmware 3020 or 3022 doesn't echo a write: it sends its own address, 6, a
+  // status byte that is always 0 and the CRC, low byte first, whatever the register or value.
+  const std::vector<uint8_t> expected = {0x01, 0x06, 0x00, 0x23, 0xA0};
+  EXPECT_EQ(with_crc({0x01, 0x06, 0x00}), expected);
+  EXPECT_EQ(reply_to(with_crc({0x01, 0x06, 0x00, 0x02, 0x00, 0x01}), captured_snapshot()), expected);
+  EXPECT_EQ(reply_to(with_crc({0x01, 0x06, 0x00, 0x04, 0x00, 0x01}), captured_snapshot()), expected);
+  EXPECT_EQ(reply_to(with_crc({0x01, 0x06, 0x00, 0x63, 0x12, 0x34}), captured_snapshot()), expected);
+}
+
+TEST(GivEnergyLvFrames, AWriteToAnEmptySlotIsAnsweredByThePack) {
+  // The pack answers writes addressed to the other slots too, with its own address.
+  const std::vector<uint8_t> expected = {0x01, 0x06, 0x00, 0x23, 0xA0};
+  EXPECT_EQ(reply_to(with_crc({0x03, 0x06, 0x00, 0x01, 0x00, 0x01}), captured_snapshot()), expected);
 }
 
 TEST(GivEnergyLvFrames, DevicesOutsideOneToFiveGetNoReply) {

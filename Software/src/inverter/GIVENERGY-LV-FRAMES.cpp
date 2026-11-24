@@ -189,8 +189,15 @@ size_t build_reply(const uint8_t* request, const Snapshot& s, uint8_t* out) {
       return finish(out, 4 + len);
     }
     case 6:
-      memcpy(out, request, kRequestLen);
-      return kRequestLen;
+      // Not an echo. A GivEnergy BMS on firmware 3020 or 3022, which this module presents itself
+      // as, answers a write with the replying pack's own address (1 for the master pack) whichever
+      // slot it was addressed to, the function code, a status byte that is always 0 (it sends 0
+      // for registers it ignores and for out-of-range values too) and the CRC. Firmware 4009 to
+      // 4011, the later LV battery, replies with 8 bytes instead, which is neither an echo nor this.
+      out[0] = kPackDevice;
+      out[1] = function;
+      out[2] = 0;
+      return finish(out, 3);
     default:
       return 0;
   }
