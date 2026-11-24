@@ -143,6 +143,30 @@ void fill_cells(givenergy_lv::Snapshot& s) {
   s.cell_sum_mV = saturate16(sum);
 }
 
+bool event_raised(EVENTS_ENUM_TYPE e) {
+  const EVENTS_STATE_TYPE state = get_event_pointer(e)->state;
+  return state == EVENT_STATE_ACTIVE || state == EVENT_STATE_ACTIVE_LATCHED;
+}
+
+// True when a zero charge limit comes only from Battery-Emulator's "battery full" rule (safety.cpp
+// zeroes the charge limit at 100% SoC): HR21 reads 100, the pack's own BMS still allows charging,
+// and the safety layer sees no pack or cell over-voltage. HR20 bit 2 isn't needed then. The G3 DSP
+// stops charging 30 s after HR21 reads 100 (or HR26 reads 0) on its own (bms-analysis docs/05), and
+// holding bit 2 for as long as the pack sits at 100% makes the inverter report a BMS over-voltage
+// that isn't there. A real GivEnergy BMS (3020, 3022 and 4009 to 4011) sets bit 2 only for a pack
+// or cell over-voltage alarm or protection, never from the SoC.
+//
+// bms_max_charge_power_W is the battery module's own limit, recorded before the safety layer
+// rewrites the limits. With the Growatt LV reader it is 0 whenever the pack clears its charge
+// enable, sends a zero charge limit (a Seplos BMS does once it latches full) or stops sending
+// limits. bms_reports_full is set by few battery modules, and never by the Growatt LV reader; it
+// is checked so that a module which does set it keeps bit 2.
+bool only_full_soc_stops_charge(uint16_t soc_pct) {
+  return soc_pct == 100 && datalayer.battery.status.bms_max_charge_power_W > 0 &&
+         !datalayer.battery.status.bms_reports_full && !event_raised(EVENT_BATTERY_OVERVOLTAGE) &&
+         !event_raised(EVENT_CELL_OVER_VOLTAGE);
+}
+
 }  // namespace
 
 GivEnergyLvRs485Inverter::GivEnergyLvRs485Inverter(HardwareSerial& port)
@@ -486,14 +510,14 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   // HR26 leaves; bit 3 (under-voltage) cuts discharge to 10%. Neither faults or latches. A real
   // GivEnergy battery raised bit 2 for 271 s straight after its last top-up to 57.5 V at the top of charge.
   // The battery side leads: whenever it allows no charge (its BMS disabled charging or stopped
-  // sending limits, or the safety layer applied its voltage limit, the user's ceiling or 100% SoC),
-  // HR26 is 0 and bit 2 goes with it; likewise a zero discharge limit raises bit 3. This module's
-  // own cell thresholds (the taper's stop and kCellUnderStop_mV) and the user's charge-voltage
-  // ceiling stay as backstops in case the battery side doesn't stop first.
+  // sending limits, or the safety layer applied its voltage limit or the user's ceiling), HR26 is
+  // 0 and bit 2 goes with it; likewise a zero discharge limit raises bit 3. This module's own cell
+  // thresholds (the taper's stop and kCellUnderStop_mV) and the user's charge-voltage ceiling stay
+  // as backstops in case the battery side doesn't stop first.
   const bool fault = datalayer.system.status.system_status == FAULT;
   const bool user_ceiling_reached = datalayer.battery_settings.user_set_voltage_limits_active &&
                                     agg.voltage_dV >= datalayer.battery_settings.max_user_set_charge_voltage_dV;
-  const bool battery_stops_charge = agg.max_charge_current_dA == 0;
+  const bool battery_stops_charge = agg.max_charge_current_dA == 0 && !only_full_soc_stops_charge(s.soc_pct);
   const bool battery_stops_discharge = agg.max_discharge_current_dA == 0;
   if (fault || battery_stops_charge || agg.cell_max_voltage_mV >= kCellStop_mV || user_ceiling_reached) {
     s.alarms |= 0x0004;

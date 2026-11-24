@@ -327,9 +327,10 @@ TEST_F(GivEnergyLvInverter, UnderVoltageAlarmAtTheLowCellStop) {
   EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms & 0x0008, 0x0008u);
 }
 
-// The battery's own BMS (or Battery-Emulator's safety layer acting on its voltage limit, the user
-// ceiling or SoC) stops charging by zeroing the charge limit. HR26 = 0 alone leaves the DSP a
-// ~1 A charge bound until its 30 s "battery full" block, so report it as full (HR20 bit 2) too.
+// The battery's own BMS (or Battery-Emulator's safety layer acting on its voltage limit or the user
+// ceiling) stops charging by zeroing the charge limit. HR26 = 0 alone leaves the DSP a ~1 A charge
+// bound until its 30 s "battery full" block, so report it as full (HR20 bit 2) too. 100% SoC alone
+// is the exception, see GivEnergyLvFullSoc below.
 TEST_F(GivEnergyLvInverter, FullAlarmWhenTheBatteryAllowsNoCharge) {
   EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
   datalayer.aggregate.max_charge_current_dA = 0;
@@ -358,6 +359,174 @@ TEST_F(GivEnergyLvInverter, NoAlarmsInNormalRunning) {
   datalayer.aggregate.cell_min_voltage_mV = 3280;
   datalayer.aggregate.voltage_dV = 530;
   EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+}
+
+// ---- 100% SoC ----
+//
+// At 100% SoC the safety layer zeroes the charge limit (EVENT_BATTERY_FULL). The G3 stops charging
+// 30 s after HR21 reads 100 on its own, so that alone sends HR26 = 0 without HR20 bit 2. Bit 2
+// still goes out for a fault, the cell stop, the user's ceiling, an over-voltage the safety layer
+// sees, and a BMS that stops charging itself.
+
+namespace {
+
+class GivEnergyLvFullSoc : public GivEnergyLvInverter {
+ protected:
+  void SetUp() override {
+    GivEnergyLvInverter::SetUp();
+    init_events();
+    reset_all_events();
+    datalayer.aggregate.voltage_dV = 546;
+    datalayer.aggregate.reported_soc = 10000;                 // HR21 = 100
+    datalayer.aggregate.max_charge_current_dA = 0;            // the safety layer's "battery full" rule
+    datalayer.aggregate.cell_max_voltage_mV = 3445;           // a full LFP pack at rest, nowhere near the stop
+    datalayer.battery.status.bms_max_charge_power_W = 13650;  // the BMS itself still allows 25 A
+  }
+  void TearDown() override { reset_all_events(); }
+
+  static uint16_t hr(const std::vector<uint8_t>& reply, int index) {
+    return static_cast<uint16_t>(reply[3 + 2 * index] << 8 | reply[3 + 2 * index + 1]);
+  }
+};
+
+}  // namespace
+
+TEST_F(GivEnergyLvFullSoc, AFullSocAloneStopsChargeWithoutTheAlarm) {
+  const auto s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.soc_pct, 100);
+  EXPECT_EQ(s.charge_limit_cA, 0);
+  EXPECT_EQ(s.discharge_limit_cA, 8000);
+  EXPECT_EQ(s.alarms, 0u);
+}
+
+TEST_F(GivEnergyLvFullSoc, TheAlarmStillComesAtTheCellStop) {
+  datalayer.aggregate.cell_max_voltage_mV = 3599;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+  datalayer.aggregate.cell_max_voltage_mV = 3600;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0x0004u);
+}
+
+TEST_F(GivEnergyLvFullSoc, TheAlarmStillComesAtTheUserCeiling) {
+  datalayer.battery_settings.user_set_voltage_limits_active = true;
+  datalayer.battery_settings.max_user_set_charge_voltage_dV = 547;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+  datalayer.battery_settings.max_user_set_charge_voltage_dV = 546;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0x0004u);
+}
+
+TEST_F(GivEnergyLvFullSoc, TheAlarmStillComesWhenTheBmsStopsCharging) {
+  datalayer.battery.status.bms_max_charge_power_W = 0;  // charge disabled, or its limits went stale
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0x0004u);
+}
+
+TEST_F(GivEnergyLvFullSoc, TheAlarmStillComesWhenTheBmsReportsFull) {
+  datalayer.battery.status.bms_reports_full = true;
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0x0004u);
+}
+
+TEST_F(GivEnergyLvFullSoc, TheAlarmStillComesForAPackOverVoltage) {
+  set_event(EVENT_BATTERY_OVERVOLTAGE, 600);
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0x0004u);
+  clear_event(EVENT_BATTERY_OVERVOLTAGE);
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+}
+
+TEST_F(GivEnergyLvFullSoc, TheAlarmStillComesForACellOverVoltage) {
+  set_event(EVENT_CELL_OVER_VOLTAGE, 0);
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0x0004u);
+}
+
+TEST_F(GivEnergyLvFullSoc, TheAlarmStillComesOnAFault) {
+  set_event(EVENT_DUMMY_ERROR, 0);
+  ASSERT_EQ(datalayer.system.status.system_status, FAULT);
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0x000Cu);
+}
+
+// The test goes by HR21, the SoC the inverter sees: 99.99% sends 99, and a zero charge limit there
+// is not the "battery full" rule, so it raises bit 2 as before.
+TEST_F(GivEnergyLvFullSoc, BelowAFullHr21AZeroChargeLimitStillRaisesTheAlarm) {
+  datalayer.aggregate.reported_soc = 9999;
+  const auto s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.soc_pct, 99);
+  EXPECT_EQ(s.alarms, 0x0004u);
+}
+
+// A full pack that the BMS lets charge but the inverter isn't charging: nothing changes.
+TEST_F(GivEnergyLvFullSoc, AChargeLimitAtFullSocRaisesNothing) {
+  datalayer.aggregate.max_charge_current_dA = 250;
+  const auto s = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
+  EXPECT_EQ(s.charge_limit_cA, 2500);
+  EXPECT_EQ(s.alarms, 0u);
+}
+
+// The DSP skips its full block and its BMS power limits if HR19 bits 0 and 1 are both clear, and
+// HR15 bit 0 cancels the block. Without bit 2 at 100% the module relies on both.
+TEST_F(GivEnergyLvFullSoc, Hr15StaysClearAndHr19KeepsBit0Or1OnTheWire) {
+  for (int16_t current_dA : {-50, 0, 1, 157}) {
+    SCOPED_TRACE(current_dA);
+    datalayer.aggregate.current_dA = current_dA;
+    FakeSerial port;
+    GivEnergyLvRs485Inverter inverter(port);
+    inverter.update_values();
+    port.feed(kHrPoll);
+    inverter.receive();
+    set_millis64(millis64() + 75);
+    inverter.receive();
+    ASSERT_EQ(port.tx.size(), 61u);
+    EXPECT_EQ(hr(port.tx, 15), 0u);
+    EXPECT_NE(hr(port.tx, 19) & 0x0003, 0u);
+    EXPECT_EQ(hr(port.tx, 20), 0u);
+    EXPECT_EQ(hr(port.tx, 21), 100u);
+    EXPECT_EQ(hr(port.tx, 26), 0u);
+  }
+}
+
+// A calibration's charge stage at 100%: without bit 2 the DSP holds its 8 A floor against
+// HR26 = 0, and the guard's trigger A ends the calibration after 60 s (trigger D used to, after 30 s).
+TEST_F(GivEnergyLvFullSoc, ACalibrationAtFullSocStillTripsTheGuard) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 80;  // the calibration's 8 A floor
+  inverter.update_values();
+  for (int s = 0; s < 60; s++) {
+    const uint64_t start = millis64();
+    set_millis64(start + 900);
+    port.feed(kHrPoll);
+    inverter.receive();
+    set_millis64(start + 1000);
+    inverter.receive();
+    inverter.update_values();
+  }
+  EXPECT_EQ(inverter.guard(), GivEnergyLvRs485Inverter::Guard::Normal) << "tripped a second early";
+  set_millis64(millis64() + 1000);
+  inverter.update_values();
+  EXPECT_EQ(inverter.guard(), GivEnergyLvRs485Inverter::Guard::EndingBoth);
+  EXPECT_EQ(get_event_pointer(EVENT_INVERTER_LIMITS_IGNORED)->data, 1);  // trigger A
+  EXPECT_EQ(inverter.snapshot().alarms, 0x000Cu);
+}
+
+// The inverter obeying at 100%: about 1 A through the DSP's own floor until its full block stops
+// the charge 30 s later. That mustn't look like a calibration.
+TEST_F(GivEnergyLvFullSoc, NoTripWhileTheInverterRunsDownAtFull) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 157;  // charging when HR21 reaches 100
+  inverter.update_values();
+  datalayer.aggregate.current_dA = 10;
+  for (int s = 0; s < 3600; s++) {
+    if (s == 30) {
+      datalayer.aggregate.current_dA = 0;
+    }
+    const uint64_t start = millis64();
+    set_millis64(start + 900);
+    port.feed(kHrPoll);
+    inverter.receive();
+    set_millis64(start + 1000);
+    inverter.receive();
+    inverter.update_values();
+  }
+  EXPECT_EQ(inverter.guard(), GivEnergyLvRs485Inverter::Guard::Normal);
+  EXPECT_EQ(inverter.snapshot().alarms, 0u);
 }
 
 TEST_F(GivEnergyLvInverter, FaultAlarmBitsAppearOnTheWire) {
