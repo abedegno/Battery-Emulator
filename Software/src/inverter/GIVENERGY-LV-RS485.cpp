@@ -245,6 +245,7 @@ void GivEnergyLvRs485Inverter::update_values() {
   snapshot_ = snapshot_from_datalayer();
   apply_guard(snapshot_);
   apply_taper_latch(snapshot_);
+  apply_direction_latch(snapshot_);
 
   if (restart_pending_ && millis64() - restart_since_ms_ >= kRestartDelayMs) {
     restart_pending_ = false;
@@ -551,6 +552,23 @@ void GivEnergyLvRs485Inverter::apply_taper_latch(givenergy_lv::Snapshot& s) {
   }
 }
 
+// HR19's direction bits. In 43 days of one-second captures from a real GivEnergy battery
+// (3,574,094 rows) they were never 0 or 1: only 2 (charging) or 3 (discharging), following the
+// sign of the current with no deadband, and a reading of exactly 0.00 A still carried 2 or 3. So a
+// non-zero current sets the direction, and a zero current keeps the last non-zero one. Holding it
+// at zero, and starting at 3 before any non-zero current since start (the real battery's usual
+// resting value, as a resting pack shows a small discharge), are my choice: the captures show
+// zero readings with either value but not what decides between them. The G3's DSP only tests
+// whether both bits are clear, so this is for fidelity, with no known effect on the inverter.
+void GivEnergyLvRs485Inverter::apply_direction_latch(givenergy_lv::Snapshot& s) {
+  if (s.current_cA > 0) {
+    direction_ = kDirectionCharging;
+  } else if (s.current_cA < 0) {
+    direction_ = kDirectionDischarging;
+  }
+  s.status = static_cast<uint16_t>((s.status & ~kDirectionMask) | direction_);
+}
+
 givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   const DATALAYER_AGGREGATE_TYPE& agg = datalayer.aggregate;
   givenergy_lv::Snapshot s{};
@@ -562,12 +580,10 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   const uint32_t full_cAh = wh_to_cAh(agg.reported_total_capacity_Wh, agg.voltage_dV);
   s.capacity_Ah = saturate16(full_cAh / 100);
   s.status = 0x00CC;  // bits 2, 3, 6 and 7, always set on a real battery in normal running
-  if (agg.current_dA <= 0) {
-    s.status |= 0x01;
-  }
-  if (agg.current_dA != 0) {
-    s.status |= 0x02;
-  }
+  // Bits 0 and 1 are the direction: 2 charging, 3 discharging, following the sign of the current
+  // with no deadband. A snapshot has no memory, so exactly zero gives the start value 3 here;
+  // apply_direction_latch() then keeps the last non-zero direction instead (see there).
+  s.status |= agg.current_dA > 0 ? kDirectionCharging : kDirectionDischarging;
   s.soc_pct = agg.reported_soc / 100;
   s.voltage_cV = agg.voltage_dV * 10;
   s.current_cA = static_cast<int16_t>(std::min(std::max(agg.current_dA * 10, -32000), 32000));

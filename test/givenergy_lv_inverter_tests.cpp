@@ -723,13 +723,69 @@ TEST_F(GivEnergyLvInverter, FaultAlarmBitsAppearOnTheWire) {
   EXPECT_EQ(port.tx[3 + 41], 0x0C);
 }
 
+// The snapshot alone has no memory, so exactly zero gives the start value, direction 3. A real
+// GivEnergy battery never sends direction 1 (idle) or 0.
 TEST_F(GivEnergyLvInverter, StatusBitsFollowTheCurrent) {
   datalayer.aggregate.current_dA = -1;
   EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().status, 0x00CF);
   datalayer.aggregate.current_dA = 50;
   EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().status, 0x00CE);
   datalayer.aggregate.current_dA = 0;
-  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().status, 0x00CD);
+  EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().status, 0x00CF);
+}
+
+// HR19's direction bits as update_values() sends them: 2 charging, 3 discharging, and at exactly
+// zero the last non-zero direction, or 3 before any non-zero current since start.
+TEST_F(GivEnergyLvInverter, ZeroCurrentAtStartReportsDischarging) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 0;
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().status, 0x00CF);
+}
+
+TEST_F(GivEnergyLvInverter, ZeroCurrentAfterChargingKeepsCharging) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 1;  // 0.1 A: no deadband
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().status, 0x00CE);
+  datalayer.aggregate.current_dA = 0;
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().status, 0x00CE);
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().status, 0x00CE);
+}
+
+TEST_F(GivEnergyLvInverter, ZeroCurrentAfterDischargingKeepsDischarging) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 50;
+  inverter.update_values();
+  ASSERT_EQ(inverter.snapshot().status, 0x00CE);
+  datalayer.aggregate.current_dA = -1;
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().status, 0x00CF);
+  datalayer.aggregate.current_dA = 0;
+  inverter.update_values();
+  EXPECT_EQ(inverter.snapshot().status, 0x00CF);
+}
+
+// The held direction reaches the wire, and every other HR19 bit stays as it was.
+TEST_F(GivEnergyLvInverter, HeldDirectionGoesOutInHr19) {
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  datalayer.aggregate.current_dA = 80;
+  inverter.update_values();
+  datalayer.aggregate.current_dA = 0;
+  inverter.update_values();
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(1075);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  EXPECT_EQ(port.tx[3 + 38], 0x00);  // HR19 = 0x00CE
+  EXPECT_EQ(port.tx[3 + 39], 0xCE);
 }
 
 TEST_F(GivEnergyLvInverter, UnitsMatchTheWire) {

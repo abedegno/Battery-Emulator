@@ -37,6 +37,7 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   void lock_out(uint8_t trigger, uint64_t now_ms);
   void apply_guard(givenergy_lv::Snapshot& s) const;
   void apply_taper_latch(givenergy_lv::Snapshot& s);
+  void apply_direction_latch(givenergy_lv::Snapshot& s);
   void handle_restart_write(uint8_t device, uint16_t value);
   void restart_emulator();
 
@@ -88,6 +89,13 @@ class GivEnergyLvRs485Inverter : public Rs485InverterProtocol {
   // restart clears it, which is fine: if the pack is still full, charging pushes the highest cell
   // back to kTaperEnd_mV within minutes and the latch re-engages.
   bool taper_latched_ = false;
+  // HR19 bits 0 and 1 (see apply_direction_latch()): the last non-zero current's direction, kept
+  // while the current reads exactly zero. Per instance, so a restart (or a new instance in the
+  // tests) starts again from kDirectionDischarging.
+  static constexpr uint16_t kDirectionMask = 0x0003;
+  static constexpr uint8_t kDirectionCharging = 2;
+  static constexpr uint8_t kDirectionDischarging = 3;
+  uint8_t direction_ = kDirectionDischarging;
   // An inverter-requested restart (see handle_restart_write()). restart_since_ms_ is when the
   // first write of the request arrived; last_declined_ms_ is when the last declined one did.
   bool restart_pending_ = false;
