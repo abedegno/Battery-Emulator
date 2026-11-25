@@ -290,3 +290,213 @@ TEST(GrowattLvCellCount, Frame0x319AloneLeavesCellCountAtZero) {
 
   EXPECT_EQ(datalayer.battery.info.number_of_cells, 0);
 }
+
+// ---- Protection causes (0x312) ----
+//
+// 0x312 bytes 0 and 1 are the protection bytes, bytes 2 and 3 the matching warnings (protocol
+// V1.04, tables 1 to 4). The temperature protections in each direction and the discharge
+// over-current protection are published as bms_protection, for inverter protocols that pass the
+// cause of a stop on. Bit positions are from the document only: no capture shows them set.
+
+static CAN_frame Frame312(uint8_t prot1, uint8_t prot2, uint8_t warn1 = 0, uint8_t warn2 = 0) {
+  return Frame(0x312, {prot1, prot2, warn1, warn2, 0x01, 0x00, 0x00, 0x10});
+}
+
+static bool NoCause() {
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  return !p.charge_over_temperature && !p.charge_under_temperature && !p.discharge_over_temperature &&
+         !p.discharge_under_temperature && !p.discharge_over_current;
+}
+
+TEST(GrowattLvProtectionCauses, NoneBeforeAnyFrame) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+}
+
+TEST(GrowattLvProtectionCauses, Prot1Bit7IsDischargeOverCurrent) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x80, 0x00));
+  b.update_values();
+  EXPECT_TRUE(datalayer.battery.status.bms_protection.discharge_over_current);
+  EXPECT_FALSE(datalayer.battery.status.bms_protection.discharge_over_temperature);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit7IsDischargeOverTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x80));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.discharge_over_temperature);
+  EXPECT_FALSE(p.charge_over_temperature || p.discharge_under_temperature || p.charge_under_temperature ||
+               p.discharge_over_current);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit6IsChargeOverTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x40));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.charge_over_temperature);
+  EXPECT_FALSE(p.discharge_over_temperature || p.discharge_under_temperature || p.charge_under_temperature ||
+               p.discharge_over_current);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit5IsDischargeUnderTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x20));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.discharge_under_temperature);
+  EXPECT_FALSE(p.charge_over_temperature || p.discharge_over_temperature || p.charge_under_temperature ||
+               p.discharge_over_current);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit4IsChargeUnderTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x10));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.charge_under_temperature);
+  EXPECT_FALSE(p.charge_over_temperature || p.discharge_over_temperature || p.discharge_under_temperature ||
+               p.discharge_over_current);
+}
+
+// The other protection bits (charge over-current, short circuit, cell and pack voltages, soft
+// start, system error, cell difference) and every warning bit leave the causes clear.
+TEST(GrowattLvProtectionCauses, OtherProtectionsAndAllWarningsAreNotCauses) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x7F, 0x0F, 0xFF, 0xFF));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+  EXPECT_FALSE(datalayer.system.status.battery_allows_contactor_closing);
+}
+
+TEST(GrowattLvProtectionCauses, CausesClearWhenTheProtectionEnds) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x80, 0xF0));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.discharge_over_current && p.discharge_over_temperature && p.charge_over_temperature &&
+              p.discharge_under_temperature && p.charge_under_temperature);
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+}
+
+// ---- Freshness of the protection causes ----
+//
+// The causes expire like the limits: a 0x312 more than 5 s old no longer says why the pack is
+// stopped, so they go back to clear ("no cause known"), even while 0x311 keeps the link alive.
+
+TEST(GrowattLvProtectionCauses, CausesClearWhen0x312GoesStaleWhile0x311KeepsArriving) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.handle_incoming_can_frame(Frame312(0x80, 0x40));
+  b.update_values();
+  ASSERT_TRUE(datalayer.battery.status.bms_protection.discharge_over_current);
+  ASSERT_TRUE(datalayer.battery.status.bms_protection.charge_over_temperature);
+
+  for (int s = 1; s <= 5; s++) {  // 5 s old is still fresh
+    set_millis64((uint64_t)s * 1000ULL);
+    b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+    b.update_values();
+  }
+  EXPECT_TRUE(datalayer.battery.status.bms_protection.discharge_over_current);
+  EXPECT_TRUE(datalayer.battery.status.bms_protection.charge_over_temperature);
+
+  set_millis64(6000);  // more than 5 s since the only 0x312
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.update_values();
+  EXPECT_TRUE(NoCause()) << "causes must clear once 0x312 is more than 5s stale";
+  EXPECT_EQ(datalayer.battery.status.max_charge_current_dA, 1000) << "a fresh 0x311 keeps its limits";
+
+  set_millis64(0);
+}
+
+TEST(GrowattLvProtectionCauses, CausesReturnOnceAFresh0x312Arrives) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x10));
+  b.update_values();
+  ASSERT_TRUE(datalayer.battery.status.bms_protection.charge_under_temperature);
+
+  set_millis64(6000);
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.update_values();
+  ASSERT_TRUE(NoCause());
+
+  set_millis64(6500);
+  b.handle_incoming_can_frame(Frame312(0x00, 0x10));
+  b.update_values();
+  EXPECT_TRUE(datalayer.battery.status.bms_protection.charge_under_temperature)
+      << "a fresh 0x312 must restore the causes right away";
+
+  set_millis64(0);
+}
+
+// When every frame stops, the limits go stale and the causes clear with them.
+TEST(GrowattLvProtectionCauses, CausesClearWhenTheWholeLinkGoesQuiet) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.handle_incoming_can_frame(Frame312(0x80, 0xF0));
+  b.update_values();
+  ASSERT_TRUE(datalayer.battery.status.bms_protection.discharge_over_temperature);
+
+  set_millis64(6000);
+  b.update_values();
+  EXPECT_EQ(datalayer.battery.status.max_charge_current_dA, 0);
+  EXPECT_TRUE(NoCause());
+
+  set_millis64(0);
+}
+
+// A 0x312 that keeps arriving can't hold the causes up once 0x311 (the frame the reader treats as
+// the link's heartbeat) has gone stale: the limits are zero for a lost link, not for those causes.
+TEST(GrowattLvProtectionCauses, CausesClearWhenTheLimitsGoStaleEvenIf0x312KeepsArriving) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.handle_incoming_can_frame(Frame312(0x80, 0x00));
+  b.update_values();
+  ASSERT_TRUE(datalayer.battery.status.bms_protection.discharge_over_current);
+
+  for (int s = 1; s <= 6; s++) {
+    set_millis64((uint64_t)s * 1000ULL);
+    b.handle_incoming_can_frame(Frame312(0x80, 0x00));
+    b.update_values();
+  }
+  EXPECT_EQ(datalayer.battery.status.max_discharge_current_dA, 0);
+  EXPECT_TRUE(NoCause());
+
+  set_millis64(0);
+}
+
+// setup() starts with no cause known, whatever an earlier run left in the datalayer.
+TEST(GrowattLvProtectionCauses, SetupClearsTheCauses) {
+  datalayer = DataLayer();
+  datalayer.battery.status.bms_protection.charge_over_temperature = true;
+  datalayer.battery.status.bms_protection.discharge_over_current = true;
+  GrowattLvBattery b;
+  b.setup();
+  EXPECT_TRUE(NoCause());
+}

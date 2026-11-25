@@ -77,6 +77,18 @@ struct CellBalancingStatus {
   uint8_t bits_[(MAX_AMOUNT_CELLS + 7) / 8] = {};
 };
 
+/** Protections the pack's own BMS reports as active, for inverter protocols that pass the cause
+ * of a stop on (GivEnergy LV's alarm word). Protection level only, not warnings. Not available for
+ * all battery types: a module that cannot decode them leaves them all false, which means "no cause
+ * known", not "no protection". The stop itself still reaches the inverter through the limits */
+struct DATALAYER_BMS_PROTECTION_TYPE {
+  bool charge_over_temperature = false;
+  bool charge_under_temperature = false;
+  bool discharge_over_temperature = false;
+  bool discharge_under_temperature = false;
+  bool discharge_over_current = false;
+};
+
 struct DATALAYER_BATTERY_STATUS_TYPE {
   /** uint32_t */
   /** Remaining energy capacity in Watt-hours */
@@ -188,6 +200,10 @@ struct DATALAYER_BATTERY_STATUS_TYPE {
   bool bms_reports_full = false;
   /** The pack's own BMS reports it completely discharged. See bms_reports_full */
   bool bms_reports_empty = false;
+
+  /** Why the pack's own BMS has stopped charging or discharging, if it says. See
+   * DATALAYER_BMS_PROTECTION_TYPE */
+  DATALAYER_BMS_PROTECTION_TYPE bms_protection;
 
   /** All cell voltages currently measured in the pack, in mV.
    * Use with battery.info.number_of_cells to get valid data.
