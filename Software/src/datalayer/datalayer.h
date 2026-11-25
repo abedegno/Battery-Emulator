@@ -78,7 +78,8 @@ struct CellBalancingStatus {
 };
 
 /** Protections the pack's own BMS reports as active, for inverter protocols that pass the cause
- * of a stop on (GivEnergy LV's alarm word). Protection level only, not warnings. Not available for
+ * of a stop on (GivEnergy LV's alarm word). Protection level: a module may count a warning only
+ * while the pack is also refusing that direction (the Growatt LV reader does). Not available for
  * all battery types: a module that cannot decode them leaves them all false, which means "no cause
  * known", not "no protection". The stop itself still reaches the inverter through the limits */
 struct DATALAYER_BMS_PROTECTION_TYPE {

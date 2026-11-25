@@ -39,7 +39,8 @@
 // missing-event ever firing (github.com/dalathegreat/Battery-Emulator/issues/3034).
 // The protection causes published from 0x312 (bms_protection) expire the same
 // way: they clear when 0x312 is more than LIMITS_STALE_MS old or the limits
-// have gone stale.
+// have gone stale. A 0x312 warning bit also raises its cause while a fresh
+// 0x311 refuses that direction (see update_values()).
 //
 // From protocol V1.03, the per-cell frames 0x315-0x318 are optional and 0x319
 // carries the highest/lowest cell voltage. In a parallel bank 0x319 counts
@@ -114,6 +115,15 @@ class GrowattLvBattery : public CanBattery {
   static const uint8_t PROT2_CHARGE_OVER_TEMPERATURE = 0x40;
   static const uint8_t PROT2_DISCHARGE_UNDER_TEMPERATURE = 0x20;
   static const uint8_t PROT2_CHARGE_UNDER_TEMPERATURE = 0x10;
+  // The matching warnings in bytes 2 (table 3) and 3 (table 4), at the same positions. A Seplos BMS
+  // (decompiled 1.43l and 1.5d) sets these and never the protection bits above; a warning becomes a
+  // cause only while the pack also refuses that direction (see update_values()). Byte 2 bit 6, the
+  // charge over-current warning, has no cause to go to.
+  static const uint8_t WARN1_DISCHARGE_OVER_CURRENT = 0x80;
+  static const uint8_t WARN2_DISCHARGE_OVER_TEMPERATURE = 0x80;
+  static const uint8_t WARN2_CHARGE_OVER_TEMPERATURE = 0x40;
+  static const uint8_t WARN2_DISCHARGE_UNDER_TEMPERATURE = 0x20;
+  static const uint8_t WARN2_CHARGE_UNDER_TEMPERATURE = 0x10;
 
   // 0x315-0x318 carry exactly 16 cell voltages (cells 1-16).
   static const uint8_t PER_CELL_FRAME_CELLS = 16;

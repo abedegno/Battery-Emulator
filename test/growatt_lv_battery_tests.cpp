@@ -369,10 +369,13 @@ TEST(GrowattLvProtectionCauses, Prot2Bit4IsChargeUnderTemperature) {
 }
 
 // The other protection bits (charge over-current, short circuit, cell and pack voltages, soft
-// start, system error, cell difference) and every warning bit leave the causes clear.
-TEST(GrowattLvProtectionCauses, OtherProtectionsAndAllWarningsAreNotCauses) {
+// start, system error, cell difference) leave the causes clear, and so does every warning bit
+// while the pack still allows both directions (see GrowattLvWarningCauses below).
+TEST(GrowattLvProtectionCauses, OtherProtectionsAndWarningsWithBothDirectionsAllowedAreNotCauses) {
   datalayer = DataLayer();
+  set_millis64(0);
   GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
   b.handle_incoming_can_frame(Frame312(0x7F, 0x0F, 0xFF, 0xFF));
   b.update_values();
   EXPECT_TRUE(NoCause());
@@ -499,6 +502,288 @@ TEST(GrowattLvProtectionCauses, SetupClearsTheCauses) {
   GrowattLvBattery b;
   b.setup();
   EXPECT_TRUE(NoCause());
+}
+
+// ---- Causes from the 0x312 warnings ----
+//
+// A Seplos BMS (decompiled 1.43l and 1.5d) never sets the protection bits. It sets the warnings in
+// bytes 2 and 3 instead and shows the stop as a zero limit or a cleared enable bit in 0x311. A
+// warning raises its cause only while the pack refuses that direction: charge causes need charge
+// refused, discharge causes (over-current too) need discharge refused. Bit positions are from the
+// protocol document and the decompiled Seplos code; no capture shows them set.
+
+namespace {
+
+enum class Cause {
+  DischargeOverCurrent,
+  DischargeOverTemperature,
+  ChargeOverTemperature,
+  DischargeUnderTemperature,
+  ChargeUnderTemperature
+};
+
+struct WarningCase {
+  uint8_t warn1, warn2;
+  Cause cause;
+  bool charge_side;
+};
+
+const WarningCase kWarningCases[] = {
+    {0x80, 0x00, Cause::DischargeOverCurrent, false},       // byte 2 bit 7
+    {0x00, 0x80, Cause::DischargeOverTemperature, false},   // byte 3 bit 7
+    {0x00, 0x40, Cause::ChargeOverTemperature, true},       // byte 3 bit 6
+    {0x00, 0x20, Cause::DischargeUnderTemperature, false},  // byte 3 bit 5
+    {0x00, 0x10, Cause::ChargeUnderTemperature, true},      // byte 3 bit 4
+};
+
+bool CauseRaised(Cause c) {
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  switch (c) {
+    case Cause::DischargeOverCurrent:
+      return p.discharge_over_current;
+    case Cause::DischargeOverTemperature:
+      return p.discharge_over_temperature;
+    case Cause::ChargeOverTemperature:
+      return p.charge_over_temperature;
+    case Cause::DischargeUnderTemperature:
+      return p.discharge_under_temperature;
+    case Cause::ChargeUnderTemperature:
+      return p.charge_under_temperature;
+  }
+  return false;
+}
+
+// Exactly one cause raised, and it is c.
+bool OnlyCause(Cause c) {
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  const int raised = p.discharge_over_current + p.discharge_over_temperature + p.charge_over_temperature +
+                     p.discharge_under_temperature + p.charge_under_temperature;
+  return raised == 1 && CauseRaised(c);
+}
+
+}  // namespace
+
+TEST(GrowattLvWarningCauses, EachWarningAloneRaisesNothingWhileItsDirectionIsAllowed) {
+  for (const WarningCase& c : kWarningCases) {
+    SCOPED_TRACE(testing::Message() << "warn1 0x" << std::hex << (int)c.warn1 << " warn2 0x" << (int)c.warn2);
+    datalayer = DataLayer();
+    set_millis64(0);
+    GrowattLvBattery b;
+    b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+    b.handle_incoming_can_frame(Frame312(0x00, 0x00, c.warn1, c.warn2));
+    b.update_values();
+    EXPECT_TRUE(NoCause());
+  }
+}
+
+// Refused by a zero limit with the enable bit still set, and by a cleared enable bit with a
+// non-zero limit: the reader zeroes the published limit either way.
+TEST(GrowattLvWarningCauses, EachWarningRaisesItsCauseWhileThePackRefusesItsDirection) {
+  for (const WarningCase& c : kWarningCases) {
+    for (bool by_enable : {false, true}) {
+      SCOPED_TRACE(testing::Message() << "warn1 0x" << std::hex << (int)c.warn1 << " warn2 0x" << (int)c.warn2
+                                      << (by_enable ? " enable cleared" : " zero limit"));
+      datalayer = DataLayer();
+      set_millis64(0);
+      GrowattLvBattery b;
+      const uint16_t ccl = (c.charge_side && !by_enable) ? 0 : 1000;
+      const uint16_t dcl = (!c.charge_side && !by_enable) ? 0 : 1000;
+      const bool charge_en = !(c.charge_side && by_enable);
+      const bool discharge_en = !(!c.charge_side && by_enable);
+      b.handle_incoming_can_frame(Frame311(ccl, dcl, charge_en, discharge_en));
+      b.handle_incoming_can_frame(Frame312(0x00, 0x00, c.warn1, c.warn2));
+      b.update_values();
+      EXPECT_TRUE(OnlyCause(c.cause));
+    }
+  }
+}
+
+// A charge warning with only discharge refused, or a discharge warning with only charge refused,
+// is not why the pack stopped that direction.
+TEST(GrowattLvWarningCauses, AWarningWithOnlyTheOtherDirectionRefusedRaisesNothing) {
+  for (const WarningCase& c : kWarningCases) {
+    SCOPED_TRACE(testing::Message() << "warn1 0x" << std::hex << (int)c.warn1 << " warn2 0x" << (int)c.warn2);
+    datalayer = DataLayer();
+    set_millis64(0);
+    GrowattLvBattery b;
+    // Refuse the other direction both ways at once.
+    if (c.charge_side) {
+      b.handle_incoming_can_frame(Frame311(1000, 0, true, false));
+    } else {
+      b.handle_incoming_can_frame(Frame311(0, 1000, false, true));
+    }
+    b.handle_incoming_can_frame(Frame312(0x00, 0x00, c.warn1, c.warn2));
+    b.update_values();
+    EXPECT_TRUE(NoCause());
+  }
+}
+
+// There is no charge over-current cause to raise, whatever the pack refuses.
+TEST(GrowattLvWarningCauses, ChargeOverCurrentWarningIsNeverACause) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(0, 0, false, false));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x40, 0x00));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+}
+
+// The other warning bits in bytes 2 and 3 (voltages, short circuit, system error, cell
+// difference) raise nothing, even with both directions refused.
+TEST(GrowattLvWarningCauses, OtherWarningBitsAreNotCausesEvenWhenRefused) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(0, 0, false, false));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x3F, 0x0F));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+}
+
+// Before the first 0x311 the published limits are zero only as the power-on default: nothing says
+// the pack refuses anything, so warnings raise nothing. The protection bits still do.
+TEST(GrowattLvWarningCauses, WarningsBeforeAny0x311RaiseNothing) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0xFF, 0xFF));
+  b.update_values();
+  EXPECT_EQ(datalayer.battery.status.max_charge_current_dA, 0);
+  EXPECT_TRUE(NoCause());
+}
+
+// The protection-bit rule doesn't need a refusal: with both directions allowed, all five still go
+// out from bytes 0 and 1.
+TEST(GrowattLvWarningCauses, ProtectionBitsStillRaiseCausesWithBothDirectionsAllowed) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.handle_incoming_can_frame(Frame312(0x80, 0xF0));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.discharge_over_current && p.discharge_over_temperature && p.charge_over_temperature &&
+              p.discharge_under_temperature && p.charge_under_temperature);
+}
+
+// A warning cause changes neither the published limits nor contactor gating: the limits are the
+// pack's own, and contactor closing still depends on the protection bytes alone.
+TEST(GrowattLvWarningCauses, LimitsAndContactorGatingAreUnchanged) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(0, 1000, true, true));  // charge refused by a zero limit
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x00, 0x40));
+  b.update_values();
+  ASSERT_TRUE(OnlyCause(Cause::ChargeOverTemperature));
+  EXPECT_EQ(datalayer.battery.status.max_charge_current_dA, 0);
+  EXPECT_EQ(datalayer.battery.status.max_discharge_current_dA, 1000);
+  EXPECT_TRUE(datalayer.system.status.battery_allows_contactor_closing);
+}
+
+TEST(GrowattLvWarningCauses, CauseClearsWhenTheWarningEnds) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(1000, 0, true, false));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x80, 0x00));
+  b.update_values();
+  ASSERT_TRUE(OnlyCause(Cause::DischargeOverCurrent));
+
+  set_millis64(1000);
+  b.handle_incoming_can_frame(Frame311(1000, 0, true, false));  // still refused
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x00, 0x00));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+
+  set_millis64(0);
+}
+
+TEST(GrowattLvWarningCauses, CauseClearsWhenTheLimitReturns) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(0, 1000, true, true));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x00, 0x10));
+  b.update_values();
+  ASSERT_TRUE(OnlyCause(Cause::ChargeUnderTemperature));
+
+  set_millis64(1000);
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));  // the charge limit is back
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x00, 0x10));  // the warning still stands
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+
+  set_millis64(0);
+}
+
+TEST(GrowattLvWarningCauses, CauseClearsWhenTheEnableBitReturns) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, false));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x00, 0x80));
+  b.update_values();
+  ASSERT_TRUE(OnlyCause(Cause::DischargeOverTemperature));
+
+  set_millis64(1000);
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, true));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x00, 0x80));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+
+  set_millis64(0);
+}
+
+// The same 5 s freshness: a stale 0x312 no longer says why the pack refuses a direction.
+TEST(GrowattLvWarningCauses, CauseClearsWhen0x312GoesStaleWhile0x311KeepsRefusing) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(1000, 0, true, true));
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x00, 0x20));
+  b.update_values();
+  ASSERT_TRUE(OnlyCause(Cause::DischargeUnderTemperature));
+
+  for (int s = 1; s <= 5; s++) {  // 5 s old is still fresh
+    set_millis64((uint64_t)s * 1000ULL);
+    b.handle_incoming_can_frame(Frame311(1000, 0, true, true));
+    b.update_values();
+  }
+  EXPECT_TRUE(OnlyCause(Cause::DischargeUnderTemperature));
+
+  set_millis64(6000);
+  b.handle_incoming_can_frame(Frame311(1000, 0, true, true));
+  b.update_values();
+  EXPECT_TRUE(NoCause()) << "a warning more than 5s old must not stay a cause";
+
+  set_millis64(0);
+}
+
+// A stale 0x311 zeroes both published limits, but that zero is the reader's loss-of-battery path,
+// not the pack refusing anything: a warning that keeps arriving raises no cause ("no cause known").
+TEST(GrowattLvWarningCauses, StaleLimitsAreNotARefusalEvenIf0x312KeepsWarning) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame311(0, 0, true, true));  // both refused while fresh
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x80, 0xF0));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  ASSERT_TRUE(p.discharge_over_current && p.discharge_over_temperature && p.charge_over_temperature &&
+              p.discharge_under_temperature && p.charge_under_temperature);
+
+  for (int s = 1; s <= 6; s++) {
+    set_millis64((uint64_t)s * 1000ULL);
+    b.handle_incoming_can_frame(Frame312(0x00, 0x00, 0x80, 0xF0));
+    b.update_values();
+  }
+  EXPECT_EQ(datalayer.battery.status.max_charge_current_dA, 0);
+  EXPECT_EQ(datalayer.battery.status.max_discharge_current_dA, 0);
+  EXPECT_TRUE(NoCause());
+
+  set_millis64(0);
 }
 // 0x319 byte 0, per Growatt's "BMS CAN-Bus protocol, low voltage" V1.04, Table 5:
 // bit 7 charge enable, bit 6 discharge enable, bit 5 request force charge I,

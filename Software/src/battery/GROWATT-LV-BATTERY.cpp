@@ -251,19 +251,38 @@ void GrowattLvBattery::update_values() {
   // Bit positions are from the protocol document (V1.04, 0x312 tables 1 and 2); no capture yet
   // shows them set.
   //
+  // A Seplos BMS (Fogstar's packs) never sets those protection bits. The decompiled Seplos 1.43l
+  // and 1.5d firmware sets the matching warning bits in bytes 2 and 3 instead (at the positions the
+  // same document gives), and shows the stop itself only as a zero limit or a cleared enable bit in
+  // 0x311. So a warning bit also raises its cause while the pack refuses that direction: charge
+  // causes need charge refused, discharge causes (over-current too) need discharge refused. A
+  // warning with its direction still allowed raises nothing. Fogstar's own build of 1.6 is assumed
+  // to do the same; no capture shows these bits set yet.
+  //
   // They expire like the limits: once 0x312 is more than LIMITS_STALE_MS old, or once the limits
   // themselves have gone stale (the reader's loss-of-battery path), the last flags are no longer
-  // news, so all go back to clear ("no cause known") until a fresh 0x312 arrives.
+  // news, so all go back to clear ("no cause known") until a fresh 0x312 arrives. The zero limits
+  // of a stale 0x311 are therefore never taken as the pack refusing a direction.
   const bool causes_stale = !have_312 || ((millis() - last_312_millis) > LIMITS_STALE_MS) || limits_stale;
   auto& causes = datalayer.battery.status.bms_protection;
   if (causes_stale) {
     causes = DATALAYER_BMS_PROTECTION_TYPE();
   } else {
-    causes.discharge_over_current = (prot1 & PROT1_DISCHARGE_OVER_CURRENT) != 0;
-    causes.discharge_over_temperature = (prot2 & PROT2_DISCHARGE_OVER_TEMPERATURE) != 0;
-    causes.charge_over_temperature = (prot2 & PROT2_CHARGE_OVER_TEMPERATURE) != 0;
-    causes.discharge_under_temperature = (prot2 & PROT2_DISCHARGE_UNDER_TEMPERATURE) != 0;
-    causes.charge_under_temperature = (prot2 & PROT2_CHARGE_UNDER_TEMPERATURE) != 0;
+    // Refused means the limit published above is zero because of the pack's own 0x311 (enable bit
+    // clear or a zero limit); limits_stale is false here. Before the first 0x311 the zero limits
+    // are only the power-on default, so nothing is refused yet and warnings raise nothing.
+    const bool charge_refused = have_311 && (!charge_en || ccl_dA == 0);
+    const bool discharge_refused = have_311 && (!discharge_en || dcl_dA == 0);
+    causes.discharge_over_current = (prot1 & PROT1_DISCHARGE_OVER_CURRENT) != 0 ||
+                                    (discharge_refused && (warn1 & WARN1_DISCHARGE_OVER_CURRENT) != 0);
+    causes.discharge_over_temperature = (prot2 & PROT2_DISCHARGE_OVER_TEMPERATURE) != 0 ||
+                                        (discharge_refused && (warn2 & WARN2_DISCHARGE_OVER_TEMPERATURE) != 0);
+    causes.charge_over_temperature = (prot2 & PROT2_CHARGE_OVER_TEMPERATURE) != 0 ||
+                                     (charge_refused && (warn2 & WARN2_CHARGE_OVER_TEMPERATURE) != 0);
+    causes.discharge_under_temperature = (prot2 & PROT2_DISCHARGE_UNDER_TEMPERATURE) != 0 ||
+                                         (discharge_refused && (warn2 & WARN2_DISCHARGE_UNDER_TEMPERATURE) != 0);
+    causes.charge_under_temperature = (prot2 & PROT2_CHARGE_UNDER_TEMPERATURE) != 0 ||
+                                      (charge_refused && (warn2 & WARN2_CHARGE_UNDER_TEMPERATURE) != 0);
   }
 }
 
