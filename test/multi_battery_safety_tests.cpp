@@ -465,3 +465,87 @@ TEST_F(MultiBatterySafetyTest, BmsReportedEmptyRaisesBatteryEmpty) {
   EXPECT_EQ(datalayer.aggregate.max_discharge_power_W, 0u);
   EXPECT_EQ(datalayer.aggregate.max_charge_power_W, 5000u);
 }
+
+/* The cell warnings used to stay active until a restart or "Clear events", long after the cell
+   had come back. The over-voltage warning follows the charge block and its hysteresis; the
+   under-voltage warning follows the limit, like the pack voltage checks. */
+TEST_F(MultiBatterySafetyTest, CellOvervoltageClearsWithTheChargeBlock) {
+  const uint16_t ceiling_mV = datalayer.battery.info.max_cell_voltage_mV;
+
+  datalayer.battery.status.cell_max_voltage_mV = ceiling_mV;
+  run_cycle();
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(datalayer.battery.status.max_charge_power_W, 0u);
+
+  // Inside the hysteresis band: still blocked, still reported
+  datalayer.battery.status.cell_max_voltage_mV = ceiling_mV - 20;
+  run_cycle();
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(datalayer.battery.status.max_charge_power_W, 0u);
+
+  // Below it: the block releases and the warning goes with it
+  datalayer.battery.status.cell_max_voltage_mV = ceiling_mV - 21;
+  run_cycle();
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE), EVENT_STATE_INACTIVE);
+  EXPECT_EQ(datalayer.battery.status.max_charge_power_W, 5000u);
+  EXPECT_EQ(datalayer.aggregate.max_charge_power_W, 5000u);
+}
+
+TEST_F(MultiBatterySafetyTest, CellUndervoltageClearsOnceAboveTheLimit) {
+  const uint16_t floor_mV = datalayer.battery.info.min_cell_voltage_mV;
+
+  datalayer.battery.status.cell_min_voltage_mV = floor_mV;
+  run_cycle();
+  EXPECT_EQ(state(EVENT_CELL_UNDER_VOLTAGE), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(datalayer.battery.status.max_discharge_power_W, 0u);
+
+  datalayer.battery.status.cell_min_voltage_mV = floor_mV + 1;
+  run_cycle();
+  EXPECT_EQ(state(EVENT_CELL_UNDER_VOLTAGE), EVENT_STATE_INACTIVE);
+  EXPECT_EQ(datalayer.battery.status.max_discharge_power_W, 5000u);
+  EXPECT_EQ(datalayer.aggregate.max_discharge_power_W, 5000u);
+}
+
+// Each pack clears only its own warning: packs 2 and 3 being healthy in the same pass must not
+// clear what pack 1 raised, and pack 1 recovering must not clear pack 2's
+TEST_F(MultiBatterySafetyTest, HealthyPackDoesNotClearAnotherPacksCellVoltageEvents) {
+  datalayer.battery.status.cell_max_voltage_mV = datalayer.battery.info.max_cell_voltage_mV;
+  datalayer.battery.status.cell_min_voltage_mV = datalayer.battery.info.min_cell_voltage_mV;
+  run_cycle();
+  run_cycle();  // A second pass, so packs 2 and 3 have run after pack 1 more than once
+
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_UNDER_VOLTAGE), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE_BAT2), EVENT_STATE_INACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_UNDER_VOLTAGE_BAT3), EVENT_STATE_INACTIVE);
+
+  datalayer.battery2.status.cell_max_voltage_mV = datalayer.battery2.info.max_cell_voltage_mV;
+  datalayer.battery2.status.cell_min_voltage_mV = datalayer.battery2.info.min_cell_voltage_mV;
+  datalayer.battery.status.cell_max_voltage_mV = 3800;
+  datalayer.battery.status.cell_min_voltage_mV = 3750;
+  run_cycle();
+
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE), EVENT_STATE_INACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_UNDER_VOLTAGE), EVENT_STATE_INACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE_BAT2), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_UNDER_VOLTAGE_BAT2), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(datalayer.aggregate.max_charge_power_W, 0u);
+  EXPECT_EQ(datalayer.aggregate.max_discharge_power_W, 0u);
+}
+
+// The critical events stay latched by design: the cells coming back clears the warnings only
+TEST_F(MultiBatterySafetyTest, CriticalCellEventsStayActiveAfterRecovery) {
+  datalayer.battery2.status.cell_max_voltage_mV = datalayer.battery2.info.max_cell_voltage_mV + 100;
+  datalayer.battery3.status.cell_min_voltage_mV = datalayer.battery3.info.min_cell_voltage_mV - 100;
+  run_cycle();
+
+  datalayer.battery2.status.cell_max_voltage_mV = 3800;
+  datalayer.battery3.status.cell_min_voltage_mV = 3750;
+  run_cycle();
+
+  EXPECT_EQ(state(EVENT_CELL_OVER_VOLTAGE_BAT2), EVENT_STATE_INACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_UNDER_VOLTAGE_BAT3), EVENT_STATE_INACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_CRITICAL_OVER_VOLTAGE_BAT2), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(state(EVENT_CELL_CRITICAL_UNDER_VOLTAGE_BAT3), EVENT_STATE_ACTIVE);
+  EXPECT_EQ(datalayer.system.status.system_status, FAULT);
+}

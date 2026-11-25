@@ -139,7 +139,9 @@ static void check_pack_voltage(DATALAYER_BATTERY_TYPE& pack, uint8_t number) {
    its own events. combine_pack_limits() starts the inverter's limits from the lowest of any joined
    pack, so a zero written here stops the whole installation. That is what it has to do: every
    joined pack takes its share of whatever current the inverter pushes or pulls, so one pack with
-   a cell at its limit is enough to stop charging or discharging. */
+   a cell at its limit is enough to stop charging or discharging. The over-voltage warning clears
+   when the charge block releases, so it keeps the same hysteresis; the under-voltage warning
+   clears as soon as the lowest cell is back above its limit. The two critical events latch. */
 static void check_cell_voltages(DATALAYER_BATTERY_TYPE& pack, uint8_t number) {
   // One charge latch per pack, so one pack releasing its block can never release another's
   static bool overvoltage_charge_blocked[3] = {false, false, false};
@@ -150,7 +152,8 @@ static void check_cell_voltages(DATALAYER_BATTERY_TYPE& pack, uint8_t number) {
     set_event(EVENT_CELL_OVER_VOLTAGE, 0, number);
     charge_blocked = true;  // Latch at the ceiling
   } else if (pack.status.cell_max_voltage_mV < (pack.info.max_cell_voltage_mV - CELL_HYSTERESIS_MV)) {
-    charge_blocked = false;  // Release only once well below the ceiling
+    charge_blocked = false;                        // Release only once well below the ceiling
+    clear_event(EVENT_CELL_OVER_VOLTAGE, number);  // The warning follows the block
   }
   if (charge_blocked) {
     pack.status.max_charge_power_W = 0;
@@ -164,6 +167,8 @@ static void check_cell_voltages(DATALAYER_BATTERY_TYPE& pack, uint8_t number) {
   if (pack.status.cell_min_voltage_mV <= pack.info.min_cell_voltage_mV) {
     set_event(EVENT_CELL_UNDER_VOLTAGE, 0, number);
     pack.status.max_discharge_power_W = 0;
+  } else {
+    clear_event(EVENT_CELL_UNDER_VOLTAGE, number);
   }
   //Cell CRITICAL undervoltage. critical latching error without automatic reset. Requires user action to inspect battery.
   if (pack.status.cell_min_voltage_mV <= (pack.info.min_cell_voltage_mV - CELL_CRITICAL_MV)) {
