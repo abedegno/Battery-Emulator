@@ -37,9 +37,10 @@ constexpr uint16_t kTaperStart_mV = 3450;  // taper begins here: no reduction be
 constexpr uint16_t kTaperEnd_mV = 3550;    // taper reaches the trickle rate here
 constexpr uint16_t kTrickle_cA = 300;      // 3 A trickle from kTaperEnd_mV to kCellStop_mV: lets
                                            // the BMS balance the top cells without stalling
-constexpr uint16_t kCellStop_mV = 3600;    // charging stops here: belt and braces, since
-                                           // Battery-Emulator's own cell over-voltage check
-                                           // isn't effective for this battery module
+constexpr uint16_t kCellStop_mV = 3600;    // charging stops here, 50 mV before the safety
+                                           // layer's cell over-voltage stop (3650 mV, which
+                                           // the Growatt LV battery module sets), so that
+                                           // one stays the backstop
 // Below this, the charge taper's latch releases (see apply_taper_latch()): mirrors a real GivEnergy
 // BMS holding 3.20 A through full; releases once the pack has clearly come off the top.
 constexpr uint16_t kTrickleRelease_mV = 3400;
