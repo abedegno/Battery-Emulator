@@ -24,6 +24,7 @@ void GrowattLvBattery::setup(void) {
 
   // Allow contactor closing once the BMS itself reports charge/discharge enabled.
   datalayer.system.status.battery_allows_contactor_closing = false;
+  datalayer.battery.status.bms_protection = DATALAYER_BMS_PROTECTION_TYPE();
 }
 
 void GrowattLvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
@@ -60,6 +61,7 @@ void GrowattLvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
         pack_count = rx_frame.data.u8[4];
       }
       have_312 = true;
+      last_312_millis = millis();
       break;
     }
 
@@ -244,12 +246,21 @@ void GrowattLvBattery::update_values() {
   // The protection causes an inverter protocol may pass on (see bms_protection in datalayer.h).
   // Bit positions are from the protocol document (V1.04, 0x312 tables 1 and 2); no capture yet
   // shows them set.
+  //
+  // They expire like the limits: once 0x312 is more than LIMITS_STALE_MS old, or once the limits
+  // themselves have gone stale (the reader's loss-of-battery path), the last flags are no longer
+  // news, so all go back to clear ("no cause known") until a fresh 0x312 arrives.
+  const bool causes_stale = !have_312 || ((millis() - last_312_millis) > LIMITS_STALE_MS) || limits_stale;
   auto& causes = datalayer.battery.status.bms_protection;
-  causes.discharge_over_current = (prot1 & PROT1_DISCHARGE_OVER_CURRENT) != 0;
-  causes.discharge_over_temperature = (prot2 & PROT2_DISCHARGE_OVER_TEMPERATURE) != 0;
-  causes.charge_over_temperature = (prot2 & PROT2_CHARGE_OVER_TEMPERATURE) != 0;
-  causes.discharge_under_temperature = (prot2 & PROT2_DISCHARGE_UNDER_TEMPERATURE) != 0;
-  causes.charge_under_temperature = (prot2 & PROT2_CHARGE_UNDER_TEMPERATURE) != 0;
+  if (causes_stale) {
+    causes = DATALAYER_BMS_PROTECTION_TYPE();
+  } else {
+    causes.discharge_over_current = (prot1 & PROT1_DISCHARGE_OVER_CURRENT) != 0;
+    causes.discharge_over_temperature = (prot2 & PROT2_DISCHARGE_OVER_TEMPERATURE) != 0;
+    causes.charge_over_temperature = (prot2 & PROT2_CHARGE_OVER_TEMPERATURE) != 0;
+    causes.discharge_under_temperature = (prot2 & PROT2_DISCHARGE_UNDER_TEMPERATURE) != 0;
+    causes.charge_under_temperature = (prot2 & PROT2_CHARGE_UNDER_TEMPERATURE) != 0;
+  }
 }
 
 void GrowattLvBattery::transmit_can(unsigned long currentMillis) {

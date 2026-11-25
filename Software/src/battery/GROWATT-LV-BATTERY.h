@@ -36,6 +36,9 @@
 // protocol less faithfully than a real GBLI6532 (e.g. Seplos/Pace-based
 // packs) could otherwise leave stale limits published forever with no
 // missing-event ever firing (github.com/dalathegreat/Battery-Emulator/issues/3034).
+// The protection causes published from 0x312 (bms_protection) expire the same
+// way: they clear when 0x312 is more than LIMITS_STALE_MS old or the limits
+// have gone stale.
 //
 // From protocol V1.03, the per-cell frames 0x315-0x318 are optional and 0x319
 // carries the highest/lowest cell voltage. In a parallel bank 0x319 counts
@@ -140,6 +143,9 @@ class GrowattLvBattery : public CanBattery {
   uint8_t prot1 = 0, prot2 = 0, warn1 = 0, warn2 = 0;
   uint8_t pack_count = 1;
   bool have_312 = false;
+  // uint32_t for the same reason as last_311_millis. Ages the protection causes published from
+  // prot1/prot2, against the same LIMITS_STALE_MS (0x312 comes at 1 Hz with 0x311).
+  uint32_t last_312_millis = 0;
 
   uint16_t remaining_cAh = 0;  // 0.01Ah units
   uint16_t full_cAh = 0;       // 0.01Ah units
