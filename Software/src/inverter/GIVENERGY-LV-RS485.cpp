@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "../battery/BATTERIES.h"
 #include "../communication/contactorcontrol/comm_contactorcontrol.h"
 #include "../communication/rs485/comm_rs485.h"
 #include "../datalayer/datalayer.h"
@@ -44,9 +45,31 @@ constexpr uint16_t kTrickleRelease_mV = 3400;
 constexpr uint16_t kCellUnderStop_mV = 2900;  // LFP low-cell stop: backup to the battery's own
                                               // discharge limit already going to 0
 
-// HR20 alarm bits that the inverter reads as "full" (bit 2) and "empty" (bit 3).
+// HR20 alarm bits, as a real GivEnergy BMS (3020 and 3022) builds them. The inverter reads bit 2 as
+// "full" (over-voltage) and bit 3 as "empty" (under-voltage). Bit 1 is a protection bit that has
+// no name yet; the module never raises it. The G3 passes the low byte to the app as battery
+// warnings.
+constexpr uint16_t kAlarmDischargeOverCurrent = 0x0001;
 constexpr uint16_t kAlarmFull = 0x0004;
 constexpr uint16_t kAlarmEmpty = 0x0008;
+constexpr uint16_t kAlarmDischargeOverTemperature = 0x0010;
+constexpr uint16_t kAlarmChargeOverTemperature = 0x0020;
+constexpr uint16_t kAlarmDischargeUnderTemperature = 0x0040;
+constexpr uint16_t kAlarmChargeUnderTemperature = 0x0080;
+
+// Whether a stop with no voltage cause also raises bit 2 (no charge) or bit 3 (no discharge): a
+// fault, a temperature or over-current stop, or a battery side that stops for a reason it doesn't
+// give. A real GivEnergy BMS doesn't: it raises bits 2 and 3 only for an over- or under-voltage,
+// so a temperature stop goes out as HR26 = 0 with bit 5 or 7 alone, and the G3's DSP still lets
+// about 1 A of charge through (2 A of discharge for HR27 = 0). With bit 2 raised the DSP's charge
+// bound drops to a hard 0 instead, and bit 3 does the same for discharge. The module has always
+// done that, so it still does; set this to false to match the real battery. The cause bits go out
+// either way. The test HardStopBitsAlsoGoOutForStopsWithoutAVoltageCause flips with it, and so do
+// the older tests that expect bit 2 or 3 for a fault or a zero limit. With false, a pack's own
+// over- or under-voltage protection that reaches the module only as a zero limit raises no bit 2
+// or 3 either: battery modules publish no voltage cause, so only the voltage causes listed in
+// snapshot_from_datalayer() would raise them.
+constexpr bool kVoltageBitsForEveryStop = true;
 
 // Calibration guard. During a battery calibration the inverter's DSP holds both current limits at
 // 8 A or more, whatever HR26 and HR27 say, and discharges past any reserve until the battery
@@ -162,6 +185,30 @@ bool only_full_soc_stops_charge(uint16_t soc_pct) {
   return soc_pct == 100 && datalayer.battery.status.bms_max_charge_power_W > 0 &&
          !datalayer.battery.status.bms_reports_full && !event_raised(EVENT_BATTERY_OVERVOLTAGE) &&
          !event_raised(EVENT_CELL_OVER_VOLTAGE);
+}
+
+// HR20's cause bits from the protections the battery modules report (bms_protection in
+// datalayer.h): pack 1's, and those of packs 2 and 3 while they are on the DC link, since any pack
+// that stops a direction stops the installation. A module that doesn't decode causes leaves them
+// clear, and then these bits stay clear too: they are never guessed from temperatures or current.
+uint16_t cause_alarms() {
+  const DATALAYER_BATTERY_TYPE* packs[3] = {
+      &datalayer.battery,
+      (battery2 && datalayer.system.status.battery2_allowed_contactor_closing) ? &datalayer.battery2 : nullptr,
+      (battery3 && datalayer.system.status.battery3_allowed_contactor_closing) ? &datalayer.battery3 : nullptr};
+  uint16_t alarms = 0;
+  for (const DATALAYER_BATTERY_TYPE* pack : packs) {
+    if (!pack) {
+      continue;
+    }
+    const DATALAYER_BMS_PROTECTION_TYPE& p = pack->status.bms_protection;
+    alarms |= (p.discharge_over_current ? kAlarmDischargeOverCurrent : 0) |
+              (p.discharge_over_temperature ? kAlarmDischargeOverTemperature : 0) |
+              (p.charge_over_temperature ? kAlarmChargeOverTemperature : 0) |
+              (p.discharge_under_temperature ? kAlarmDischargeUnderTemperature : 0) |
+              (p.charge_under_temperature ? kAlarmChargeUnderTemperature : 0);
+  }
+  return alarms;
 }
 
 }  // namespace
@@ -553,21 +600,26 @@ givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   // bound to 0 outside a calibration, and to ~180 W during one, lower than the 8 A floor a zero
   // HR26 leaves; bit 3 (under-voltage) cuts discharge to 10%. Neither faults or latches. A real
   // GivEnergy battery raised bit 2 for 271 s straight after its last top-up to 57.5 V at the top of charge.
-  // The battery side leads: whenever it allows no charge (its BMS disabled charging or stopped
-  // sending limits, or the safety layer applied its voltage limit or the user's ceiling), HR26 is
-  // 0 and bit 2 goes with it; likewise a zero discharge limit raises bit 3. This module's own cell
-  // thresholds (the taper's stop and kCellUnderStop_mV) and the user's charge-voltage ceiling stay
-  // as backstops in case the battery side doesn't stop first.
+  // Bits 2 and 3 go out for a voltage cause: this module's own cell thresholds (the taper's stop
+  // and kCellUnderStop_mV), the user's charge-voltage ceiling, and the safety layer's pack voltage
+  // checks. With kVoltageBitsForEveryStop they also go out whenever the battery side allows no
+  // charge (its BMS disabled charging or stopped sending limits, the safety layer applied a limit)
+  // or no discharge, whatever the cause, and on a fault.
   const bool fault = datalayer.system.status.system_status == FAULT;
   const bool user_ceiling_reached = datalayer.battery_settings.user_set_voltage_limits_active &&
                                     agg.voltage_dV >= datalayer.battery_settings.max_user_set_charge_voltage_dV;
+  const bool over_voltage =
+      agg.cell_max_voltage_mV >= kCellStop_mV || user_ceiling_reached || event_raised(EVENT_BATTERY_OVERVOLTAGE);
+  const bool under_voltage = agg.cell_min_voltage_mV <= kCellUnderStop_mV || event_raised(EVENT_BATTERY_UNDERVOLTAGE);
   const bool battery_stops_charge = agg.max_charge_current_dA == 0 && !only_full_soc_stops_charge(s.soc_pct);
   const bool battery_stops_discharge = agg.max_discharge_current_dA == 0;
-  if (fault || battery_stops_charge || agg.cell_max_voltage_mV >= kCellStop_mV || user_ceiling_reached) {
-    s.alarms |= 0x0004;
+  if (over_voltage || (kVoltageBitsForEveryStop && (fault || battery_stops_charge))) {
+    s.alarms |= kAlarmFull;
   }
-  if (fault || battery_stops_discharge || agg.cell_min_voltage_mV <= kCellUnderStop_mV) {
-    s.alarms |= 0x0008;
+  if (under_voltage || (kVoltageBitsForEveryStop && (fault || battery_stops_discharge))) {
+    s.alarms |= kAlarmEmpty;
   }
+  // The causes the battery side reports, whatever bits 2 and 3 do.
+  s.alarms |= cause_alarms();
   return s;
 }

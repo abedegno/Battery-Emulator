@@ -4,6 +4,8 @@
 #include <deque>
 #include <vector>
 
+#include "../Software/src/battery/BATTERIES.h"
+#include "../Software/src/battery/TEST-FAKE-BATTERY.h"
 #include "../Software/src/datalayer/datalayer.h"
 #include "../Software/src/devboard/utils/events.h"
 #include "../Software/src/devboard/utils/types.h"
@@ -361,6 +363,179 @@ TEST_F(GivEnergyLvInverter, NoAlarmsInNormalRunning) {
   datalayer.aggregate.cell_min_voltage_mV = 3280;
   datalayer.aggregate.voltage_dV = 530;
   EXPECT_EQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms, 0u);
+}
+
+// ---- Cause bits ----
+//
+// A real GivEnergy BMS (3020 and 3022) raises HR20 bit 0 for a discharge over-current protection
+// and bits 4 to 7 for over- and under-temperature protections in each direction. The module takes
+// them from the protections the battery module reports (bms_protection in the datalayer). Bits 2
+// and 3 keep going out for every stop as before (kVoltageBitsForEveryStop).
+
+namespace {
+
+class GivEnergyLvCauses : public GivEnergyLvInverter {
+ protected:
+  void SetUp() override {
+    GivEnergyLvInverter::SetUp();
+    init_events();
+    reset_all_events();
+  }
+  void TearDown() override {
+    reset_all_events();
+    delete battery2;
+    battery2 = nullptr;
+  }
+  static DATALAYER_BMS_PROTECTION_TYPE& causes() { return datalayer.battery.status.bms_protection; }
+  static uint16_t alarms() { return GivEnergyLvRs485Inverter::snapshot_from_datalayer().alarms; }
+};
+
+}  // namespace
+
+// One bit per cause, with the limits still open (a cause the BMS reports before its limit follows).
+TEST_F(GivEnergyLvCauses, DischargeOverCurrentRaisesBit0) {
+  causes().discharge_over_current = true;
+  EXPECT_EQ(alarms(), 0x0001u);
+}
+
+TEST_F(GivEnergyLvCauses, DischargeOverTemperatureRaisesBit4) {
+  causes().discharge_over_temperature = true;
+  EXPECT_EQ(alarms(), 0x0010u);
+}
+
+TEST_F(GivEnergyLvCauses, ChargeOverTemperatureRaisesBit5) {
+  causes().charge_over_temperature = true;
+  EXPECT_EQ(alarms(), 0x0020u);
+}
+
+TEST_F(GivEnergyLvCauses, DischargeUnderTemperatureRaisesBit6) {
+  causes().discharge_under_temperature = true;
+  EXPECT_EQ(alarms(), 0x0040u);
+}
+
+TEST_F(GivEnergyLvCauses, ChargeUnderTemperatureRaisesBit7) {
+  causes().charge_under_temperature = true;
+  EXPECT_EQ(alarms(), 0x0080u);
+}
+
+TEST_F(GivEnergyLvCauses, EveryCauseTogether) {
+  causes().discharge_over_current = true;
+  causes().discharge_over_temperature = true;
+  causes().charge_over_temperature = true;
+  causes().discharge_under_temperature = true;
+  causes().charge_under_temperature = true;
+  EXPECT_EQ(alarms(), 0x00F1u) << "bit 1 has no cause behind it and must stay clear";
+}
+
+// A battery module that doesn't decode causes leaves them clear, and no cause bit is guessed from
+// the temperatures.
+TEST_F(GivEnergyLvCauses, NoCauseBitsWithoutAReportedCause) {
+  datalayer.aggregate.temperature_min_dC = -150;
+  datalayer.aggregate.temperature_max_dC = 650;
+  EXPECT_EQ(alarms(), 0u);
+  datalayer.aggregate.max_charge_current_dA = 0;
+  datalayer.aggregate.max_discharge_current_dA = 0;
+  EXPECT_EQ(alarms() & 0x00F3, 0u);
+}
+
+// The stopping behaviour stays as it was: a stop with no voltage cause zeroes the limit and still
+// raises bit 2 (or 3), so the DSP's bound drops to a hard 0, not the 1 A that HR26 = 0 alone
+// leaves. A real GivEnergy BMS would send the cause bit alone (0x0010, 0x0020, ... and 0x00C0 for
+// the cold pack). This is the test that flips with kVoltageBitsForEveryStop.
+TEST_F(GivEnergyLvCauses, HardStopBitsAlsoGoOutForStopsWithoutAVoltageCause) {
+  struct Case {
+    bool DATALAYER_BMS_PROTECTION_TYPE::* cause;
+    bool DATALAYER_BMS_PROTECTION_TYPE::* second_cause;
+    bool stops_charge;
+    bool stops_discharge;
+    uint16_t expected;
+  };
+  using P = DATALAYER_BMS_PROTECTION_TYPE;
+  const Case cases[] = {
+      {&P::discharge_over_current, nullptr, false, true, 0x0009},
+      {&P::discharge_over_temperature, nullptr, false, true, 0x0018},
+      {&P::charge_over_temperature, nullptr, true, false, 0x0024},
+      {&P::discharge_under_temperature, nullptr, false, true, 0x0048},
+      {&P::charge_under_temperature, nullptr, true, false, 0x0084},
+      {&P::charge_under_temperature, &P::discharge_under_temperature, true, true, 0x00CC},  // a cold pack
+      {nullptr, nullptr, true, false, 0x0004},  // a BMS that doesn't say why: as before
+      {nullptr, nullptr, false, true, 0x0008},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.expected);
+    causes() = P{};
+    if (c.cause) {
+      causes().*c.cause = true;
+    }
+    if (c.second_cause) {
+      causes().*c.second_cause = true;
+    }
+    datalayer.aggregate.max_charge_current_dA = c.stops_charge ? 0 : 800;
+    datalayer.aggregate.max_discharge_current_dA = c.stops_discharge ? 0 : 800;
+    EXPECT_EQ(alarms(), c.expected);
+  }
+}
+
+TEST_F(GivEnergyLvCauses, CausesGoOutBesideTheVoltageBits) {
+  causes().charge_over_temperature = true;
+  datalayer.aggregate.cell_max_voltage_mV = 3600;  // the module's own cell stop
+  EXPECT_EQ(alarms(), 0x0024u);
+  datalayer.aggregate.cell_max_voltage_mV = 3300;
+  datalayer.aggregate.cell_min_voltage_mV = 2900;  // the module's own low-cell stop
+  EXPECT_EQ(alarms(), 0x0028u);
+}
+
+TEST_F(GivEnergyLvCauses, CausesGoOutOnAFault) {
+  causes().discharge_over_current = true;
+  set_event(EVENT_DUMMY_ERROR, 0);
+  ASSERT_EQ(datalayer.system.status.system_status, FAULT);
+  EXPECT_EQ(alarms() & 0x00F3, 0x0001u);
+}
+
+// At 100% SoC with the BMS still allowing charge, bit 2 stays clear, and a cause still goes out.
+TEST_F(GivEnergyLvCauses, FullSocKeepsBit2ClearButNotTheCause) {
+  datalayer.aggregate.reported_soc = 10000;
+  datalayer.aggregate.max_charge_current_dA = 0;
+  datalayer.battery.status.bms_max_charge_power_W = 13650;
+  causes().discharge_under_temperature = true;
+  EXPECT_EQ(alarms(), 0x0040u);
+}
+
+// The safety layer's pack voltage checks are voltage causes for bits 2 and 3. They zero the limit
+// in the same pass, so before this change they already raised the bits through the zero limit.
+TEST_F(GivEnergyLvCauses, PackVoltageEventsAreVoltageCauses) {
+  set_event(EVENT_BATTERY_OVERVOLTAGE, 600);
+  EXPECT_EQ(alarms(), 0x0004u);
+  clear_event(EVENT_BATTERY_OVERVOLTAGE);
+  set_event(EVENT_BATTERY_UNDERVOLTAGE, 450);
+  EXPECT_EQ(alarms(), 0x0008u);
+  clear_event(EVENT_BATTERY_UNDERVOLTAGE);
+  EXPECT_EQ(alarms(), 0u);
+}
+
+// A second pack on the DC link reports its own causes; one held off the link doesn't count.
+TEST_F(GivEnergyLvCauses, AJoinedSecondPackReportsItsCausesToo) {
+  battery2 = new TestFakeBattery(&datalayer.battery2, CAN_Interface::CAN_NATIVE);
+  datalayer.battery2.status.bms_protection.charge_over_temperature = true;
+  datalayer.system.status.battery2_allowed_contactor_closing = true;
+  EXPECT_EQ(alarms(), 0x0020u);
+  datalayer.system.status.battery2_allowed_contactor_closing = false;
+  EXPECT_EQ(alarms(), 0u);
+}
+
+TEST_F(GivEnergyLvCauses, CauseBitsAppearOnTheWire) {
+  causes().charge_over_temperature = true;
+  causes().discharge_over_current = true;
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(1075);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  EXPECT_EQ(port.tx[3 + 40], 0x00);  // HR20 = 0x0021
+  EXPECT_EQ(port.tx[3 + 41], 0x21);
 }
 
 // ---- 100% SoC ----
