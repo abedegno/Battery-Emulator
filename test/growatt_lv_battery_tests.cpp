@@ -500,3 +500,72 @@ TEST(GrowattLvProtectionCauses, SetupClearsTheCauses) {
   b.setup();
   EXPECT_TRUE(NoCause());
 }
+// 0x319 byte 0, per Growatt's "BMS CAN-Bus protocol, low voltage" V1.04, Table 5:
+// bit 7 charge enable, bit 6 discharge enable, bit 5 request force charge I,
+// bit 4 request force charge II (NULL per the spec), bits 1-0 battery type.
+// Bits 3 and 2 are not used.
+static CAN_frame Frame319(uint8_t byte0) {
+  return Frame(0x319, {byte0, 0x0D, 0x54, 0x0D, 0x46, 0x01, 0x10, 0x00});  // 3412 / 3398 mV
+}
+
+TEST(GrowattLv0x319Flags, EachBitIsReadFromItsTable5Position) {
+  struct Case {
+    uint8_t byte0;
+    bool charge_en, discharge_en, force_chg_1, force_chg_2;
+  };
+  const Case cases[] = {
+      {0x80, true, false, false, false},   // bit 7: charge enable
+      {0x40, false, true, false, false},   // bit 6: discharge enable
+      {0x20, false, false, true, false},   // bit 5: request force charge I
+      {0x10, false, false, false, true},   // bit 4: request force charge II
+      {0xC0, true, true, false, false},    // both directions enabled, mid SOC
+      {0x60, false, true, true, false},    // nearly empty: discharge allowed, force charge requested
+      {0x0C, false, false, false, false},  // bits 3 and 2 are unused
+      {0x03, false, false, false, false},  // battery type only
+  };
+  for (const Case& c : cases) {
+    datalayer = DataLayer();
+    GrowattLvBattery b;
+    b.handle_incoming_can_frame(Frame319(c.byte0));
+    EXPECT_EQ(b.charge_enabled(), c.charge_en) << "byte0 0x" << std::hex << (int)c.byte0;
+    EXPECT_EQ(b.discharge_enabled(), c.discharge_en) << "byte0 0x" << std::hex << (int)c.byte0;
+    EXPECT_EQ(b.force_charge_1_requested(), c.force_chg_1) << "byte0 0x" << std::hex << (int)c.byte0;
+    EXPECT_EQ(b.force_charge_2_requested(), c.force_chg_2) << "byte0 0x" << std::hex << (int)c.byte0;
+  }
+}
+
+// Once 0x311 has arrived its status bits own the enable state: a later 0x319
+// with different enable bits does not change it, but its force-charge request
+// is still read.
+TEST(GrowattLv0x319Flags, EnableBitsAreIgnoredOnce0x311HasArrived) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+
+  b.handle_incoming_can_frame(Frame311(1000, 1000, true, false));
+  b.handle_incoming_can_frame(Frame319(0x60));  // discharge enable + force charge I, no charge enable
+  b.update_values();
+
+  EXPECT_TRUE(b.charge_enabled());
+  EXPECT_FALSE(b.discharge_enabled());
+  EXPECT_TRUE(b.force_charge_1_requested());
+  EXPECT_EQ(datalayer.battery.status.max_charge_current_dA, 1000);
+  EXPECT_EQ(datalayer.battery.status.max_discharge_current_dA, 0);
+}
+
+// Before 0x311 there are no limits yet, so the 0x319 enable bits cannot
+// open either direction on their own.
+TEST(GrowattLv0x319Flags, EnableBitsAloneDoNotPublishLimits) {
+  datalayer = DataLayer();
+  set_millis64(0);
+  GrowattLvBattery b;
+
+  b.handle_incoming_can_frame(Frame319(0xC0));
+  b.update_values();
+
+  EXPECT_TRUE(b.charge_enabled());
+  EXPECT_TRUE(b.discharge_enabled());
+  EXPECT_EQ(datalayer.battery.status.max_charge_current_dA, 0);
+  EXPECT_EQ(datalayer.battery.status.max_discharge_current_dA, 0);
+  EXPECT_FALSE(datalayer.system.status.battery_allows_contactor_closing);
+}

@@ -21,9 +21,10 @@
 // is based on (github.com/schmellic/growatt2solis). Notably:
 //  - 0x311 byte 7 bits 5/6 are the charge/discharge-enable bits, and are
 //    authoritative: a real idle->discharge->charge capture showed them
-//    track live BMS state correctly, while 0x319's own enable bits (byte 0
-//    bits 5/6) stayed constant throughout, including during a real ~10A
-//    discharge. 0x319's bits are used only before the first 0x311 arrives.
+//    track live BMS state correctly. 0x319 byte 0 also carries charge
+//    enable (bit 7) and discharge enable (bit 6), plus the force-charge
+//    requests (bits 5 and 4), per the protocol's Table 5; its enable bits
+//    are used only before the first 0x311 arrives.
 //  - 0x312 byte 4 is the live parallel pack count, confirmed against a real
 //    2-pack system reporting exactly 2x the single-pack current ceiling.
 //  - 0x313 bytes 0-1 (pack voltage) are 0.01V, not 0.1V - confirmed by
@@ -65,6 +66,12 @@ class GrowattLvBattery : public CanBattery {
   void transmit_can(unsigned long currentMillis) override;
 
   static constexpr const char* Name = "Growatt LV (GBLI-series) battery via CAN, 500kbit/s";
+
+  // The parsed enable and force-charge flags, read-only
+  bool charge_enabled() const { return charge_en; }
+  bool discharge_enabled() const { return discharge_en; }
+  bool force_charge_1_requested() const { return force_chg_1; }
+  bool force_charge_2_requested() const { return force_chg_2; }
 
  private:
   // GBLI6532 datasheet: 5kW / 104.2A max charge/discharge per pack. A real
@@ -160,8 +167,8 @@ class GrowattLvBattery : public CanBattery {
 
   bool charge_en = false;
   bool discharge_en = false;
-  bool force_chg_1 = false;
-  bool force_chg_2 = false;
+  bool force_chg_1 = false;  // 0x319 byte 0 bit 5: request force charge I
+  bool force_chg_2 = false;  // 0x319 byte 0 bit 4: request force charge II (NULL per spec)
 
   // 0x319 bytes 1-4: fallback max/min cell voltage (1 mV), used only when no
   // per-cell frame (0x315-0x318) has populated a cell - see update_values().

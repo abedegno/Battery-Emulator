@@ -45,8 +45,8 @@ void GrowattLvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
 
       // Status bits live in the low byte of the big-endian pair (byte 7):
       // bit 5 = discharge enable, bit 6 = charge enable. This is the
-      // authoritative source for enable state once seen - see the header
-      // comment for why 0x319's own enable bits aren't trusted instead.
+      // authoritative source for enable state once seen; 0x319's enable
+      // bits are only a fallback until the first 0x311 arrives.
       discharge_en = (status_word & 0x0020) != 0;
       charge_en = (status_word & 0x0040) != 0;
       break;
@@ -83,13 +83,17 @@ void GrowattLvBattery::handle_incoming_can_frame(CAN_frame rx_frame) {
       break;
 
     case 0x319:  // Force-charge request + fallback enable bits + max/min cell voltage
-      force_chg_2 = (rx_frame.data.u8[0] & 0x04) != 0;  // bit 2
-      force_chg_1 = (rx_frame.data.u8[0] & 0x08) != 0;  // bit 3
-      // Only used before the first 0x311 arrives; a real capture showed this
-      // frame's own enable bits (byte 0 bits 5/6) don't track live state.
+      // Byte 0 per protocol V1.04 Table 5: bit 7 charge enable, bit 6
+      // discharge enable, bit 5 request force charge I, bit 4 request force
+      // charge II (the spec says to use bit 5 and that bit 4 is NULL), bits
+      // 1-0 battery type.
+      force_chg_1 = (rx_frame.data.u8[0] & 0x20) != 0;  // bit 5
+      force_chg_2 = (rx_frame.data.u8[0] & 0x10) != 0;  // bit 4
+      // The enable bits are only used before the first 0x311 arrives; 0x311's
+      // status bits are authoritative after that.
       if (!have_311) {
-        discharge_en = (rx_frame.data.u8[0] & 0x20) != 0;  // bit 5
-        charge_en = (rx_frame.data.u8[0] & 0x40) != 0;     // bit 6
+        discharge_en = (rx_frame.data.u8[0] & 0x40) != 0;  // bit 6
+        charge_en = (rx_frame.data.u8[0] & 0x80) != 0;     // bit 7
       }
       // Fallback max/min cell voltage (1 mV) - from protocol V1.03 the
       // per-cell frames below are optional, and this carries the same
