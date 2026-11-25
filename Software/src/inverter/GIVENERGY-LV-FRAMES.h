@@ -15,6 +15,7 @@ constexpr size_t kMaxReplyLen = 61;  // FC3 reply to HR0..HR27
 constexpr uint8_t kPackDevice = 1;   // the pack; 2 to 5 are empty slots
 constexpr uint8_t kLastDevice = 5;
 constexpr uint16_t kHoldingCount = 28;
+constexpr size_t kSerialLen = 10;  // HR5 to HR9, and the start of IR block 1
 
 // The three input-register blocks the inverter reads from each device.
 constexpr uint16_t kBlock1Start = 0x00, kBlock1Count = 21;
@@ -26,12 +27,18 @@ uint16_t crc16(const uint8_t* data, size_t len);
 // True for an 8-byte FC3, FC4 or FC6 request with a valid CRC.
 bool is_request(const uint8_t* frame);
 
+// True for a serial the module can send as it is: exactly kSerialLen letters or digits, as on a
+// real battery (DX2319G000). A shorter one would be padded with spaces on the wire, and the
+// inverter passes the serial on to GivTCP, which builds MQTT topics and Home Assistant entity IDs
+// from it.
+bool valid_serial(const char* serial);
+
 // Every value the battery puts on the wire, already in wire units. The
 // inverter module fills it from the datalayer; the tests fill it from a
 // capture.
 struct Snapshot {
-  char serial[11];    // 10 ASCII characters
-  uint16_t firmware;  // HR13 and IR block 2. 3011 or higher makes the G3 use HR26/HR27
+  char serial[kSerialLen + 1];  // 10 ASCII characters
+  uint16_t firmware;            // HR13 and IR block 2. 3011 or higher makes the G3 use HR26/HR27
   // Holding registers
   uint16_t capacity_Ah;         // HR11
   uint32_t clock_hash;          // HR17 (low half) and HR18 (high half); ticks once a second

@@ -4,6 +4,7 @@
 #include "InverterProtocol.h"
 
 #include <stdint.h>
+#include <string>
 
 // Inverter contactor workaround modes
 enum inverter_contactor_mode_enum {
@@ -49,6 +50,8 @@ extern uint32_t inverter_modbus_watchdog_timeout_s;
 extern bool inverter_modbus_watchdog_changed;
 // Should a non-zero RebootCommand in register 407 restart the emulator?
 extern bool user_selected_accept_inverter_reboot;
+// GivEnergy LV: the battery serial to report. Empty, or not 10 letters or digits, means the default.
+extern std::string user_selected_givenergy_lv_serial;
 // Inverter wall clock from registers 403-406, Unix epoch seconds. 0 = nothing received since boot.
 extern uint64_t inverter_modbus_utc_epoch_s;
 #endif

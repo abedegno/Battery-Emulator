@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <deque>
+#include <string>
 #include <vector>
 
 #include "../Software/src/datalayer/datalayer.h"
@@ -71,7 +72,9 @@ class GivEnergyLvInverter : public ::testing::Test {
     // direction, which HR20 reports (see *WhenTheBatteryAllowsNo* below).
     datalayer.aggregate.max_charge_current_dA = 800;
     datalayer.aggregate.max_discharge_current_dA = 800;
+    user_selected_givenergy_lv_serial.clear();
   }
+  void TearDown() override { user_selected_givenergy_lv_serial.clear(); }
 };
 
 }  // namespace
@@ -583,6 +586,36 @@ TEST_F(GivEnergyLvInverter, UnitsMatchTheWire) {
   const givenergy_lv::Snapshot s2 = GivEnergyLvRs485Inverter::snapshot_from_datalayer();
   EXPECT_EQ(s2.full_capacity_cAh, 62500);
   EXPECT_EQ(s2.capacity_Ah, 625);
+}
+
+TEST_F(GivEnergyLvInverter, ReportsTheSerialFromTheSettings) {
+  // Someone replacing a real GivEnergy battery keeps its serial, so GivTCP's entities carry over.
+  user_selected_givenergy_lv_serial = "DX2319G000";
+  FakeSerial port;
+  GivEnergyLvRs485Inverter inverter(port);
+  inverter.update_values();
+  EXPECT_STREQ(inverter.snapshot().serial, "DX2319G000");
+  port.feed(kHrPoll);
+  inverter.receive();
+  set_millis64(1075);
+  inverter.receive();
+  ASSERT_EQ(port.tx.size(), 61u);
+  // HR5 to HR9, two characters each, as they are.
+  const std::string hr5_to_hr9(port.tx.begin() + 3 + 10, port.tx.begin() + 3 + 20);
+  EXPECT_EQ(hr5_to_hr9, "DX2319G000");
+}
+
+TEST_F(GivEnergyLvInverter, AnEmptySerialSettingReportsTheDefault) {
+  user_selected_givenergy_lv_serial = "";
+  EXPECT_STREQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().serial, "EM2026G001");
+}
+
+TEST_F(GivEnergyLvInverter, AnInvalidSerialSettingReportsTheDefault) {
+  // The settings page refuses these; a value that got into NVM anyway mustn't reach the wire.
+  for (const char* serial : {"DX2319G00", "DX2319G0001", "DX2319 000"}) {
+    user_selected_givenergy_lv_serial = serial;
+    EXPECT_STREQ(GivEnergyLvRs485Inverter::snapshot_from_datalayer().serial, "EM2026G001") << serial;
+  }
 }
 
 TEST_F(GivEnergyLvInverter, FullCapacityNoLongerClampsAt16Bits) {

@@ -1127,6 +1127,10 @@ String raw_settings_processor(const String& var, BatteryEmulatorSettingsStore& s
     return settings.getBool("INVACCREB") ? "checked" : "";
   }
 
+  if (var == "GIVSERIAL") {
+    return settings.getString("GIVSERIAL");
+  }
+
   if (var == "INVWDT") {
     // Not editable: the value comes from the inverter (register 402) and is only kept in NVM so it
     // survives a reboot. "(default)" marks the value we start from when no inverter has changed it.
@@ -1850,6 +1854,11 @@ String qnhck_zero_text(uint16_t zero_mV) {
       display: contents;
     }
 
+    form .if-givenergy { display: none; }
+    form[data-inverter="26"] .if-givenergy {
+      display: contents;
+    }
+
     form .if-pylon { display: none; }
     form[data-battery="22"] .if-pylon,
     form[data-inverter="10"] .if-pylon {
@@ -2313,6 +2322,12 @@ String qnhck_zero_text(uint16_t zero_mV) {
         <div class="if-invreboot">
         <label>Accept reboot command from inverter: </label>
         <input type='checkbox' name='INVACCREB' value='on' %INVACCREB% />
+        </div>
+
+        <div class="if-givenergy">
+        <label>GivEnergy, battery serial: </label>
+        <input type='text' name='GIVSERIAL' value="%GIVSERIAL%" pattern="[A-Za-z0-9]{10}"
+        placeholder="EM2026G001" />
         </div>
 
         <div class="if-bydmodbus">

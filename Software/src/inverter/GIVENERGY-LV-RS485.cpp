@@ -17,6 +17,8 @@ namespace {
 // HR17/HR18 hash the battery's clock; any value ticking once a second will do.
 constexpr uint32_t kClockSeed = 0x389D0000;
 
+// Reported unless the user sets the serial of the battery this replaces (GIVSERIAL), so that
+// GivTCP's Home Assistant entities carry over.
 constexpr char kSerial[] = "EM2026G001";
 constexpr uint16_t kFirmware = 3022;     // the current BMS release; 3011 or higher selects HR26/HR27 on a G3
 constexpr uint16_t kLimitCap_cA = 9000;  // 90 A: the new circuit has a 100 A DC MCB
@@ -504,7 +506,9 @@ void GivEnergyLvRs485Inverter::apply_taper_latch(givenergy_lv::Snapshot& s) {
 givenergy_lv::Snapshot GivEnergyLvRs485Inverter::snapshot_from_datalayer() {
   const DATALAYER_AGGREGATE_TYPE& agg = datalayer.aggregate;
   givenergy_lv::Snapshot s{};
-  std::strcpy(s.serial, kSerial);
+  // The settings page only saves a valid serial; checked again so nothing longer reaches s.serial.
+  const char* serial = user_selected_givenergy_lv_serial.c_str();
+  std::strcpy(s.serial, givenergy_lv::valid_serial(serial) ? serial : kSerial);
   s.firmware = kFirmware;
 
   const uint32_t full_cAh = wh_to_cAh(agg.reported_total_capacity_Wh, agg.voltage_dV);

@@ -65,6 +65,7 @@ uint32_t inverter_modbus_watchdog_timeout_s = MODBUS_INV_WATCHDOG_DEFAULT_S;
 bool inverter_modbus_watchdog_changed = false;
 bool user_selected_accept_inverter_reboot = false;
 uint64_t inverter_modbus_utc_epoch_s = 0;
+std::string user_selected_givenergy_lv_serial;
 
 std::vector<InverterProtocolType> supported_inverter_protocols() {
   std::vector<InverterProtocolType> types;

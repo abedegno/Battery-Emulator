@@ -19,6 +19,7 @@
 #include "../../datalayer/datalayer.h"
 #include "../../datalayer/datalayer_extended.h"
 #include "../../devboard/safety/safety.h"
+#include "../../inverter/GIVENERGY-LV-FRAMES.h"
 #include "../../inverter/INVERTERS.h"
 #include "../../lib/bblanchon-ArduinoJson/ArduinoJson.h"
 #include "../../shunt/QNHCK2-16.h"
@@ -663,9 +664,9 @@ void init_webserver() {
 #endif  // SMALL_FLASH_DEVICE
   };
 
-  const char* stringSettingNames[] = {"APPASSWORD", "HOSTNAME",    "MQTTSERVER", "MQTTUSER",  "MQTTPASSWORD",
-                                      "HTTPUSER",   "HTTPPASS",    "LOCALIP",    "GATEWAY",   "SUBNET",
-                                      "DNS",        "HADISCTOPIC", "SYSLOGIP",   "ESPNOWMACS"};
+  const char* stringSettingNames[] = {"APPASSWORD", "HOSTNAME",    "MQTTSERVER", "MQTTUSER",   "MQTTPASSWORD",
+                                      "HTTPUSER",   "HTTPPASS",    "LOCALIP",    "GATEWAY",    "SUBNET",
+                                      "DNS",        "HADISCTOPIC", "SYSLOGIP",   "ESPNOWMACS", "GIVSERIAL"};
 
   // Balancing strategy of the 1st, 2nd and 3rd Nissan LEAF pack
   const char* leafChgStaRqNames[] = {"CHGSTARQ", "CHGSTARQ2", "CHGSTARQ3"};
@@ -699,6 +700,14 @@ void init_webserver() {
         if (requestedWebAuth && (requestedHttpUser.isEmpty() || requestedHttpPass.isEmpty())) {
           request->send(400, "text/plain",
                         "Set a username and password before enabling web interface password protection.");
+          return;
+        }
+
+        // Stored as typed, so it has to fit the frame exactly: no padding or cutting.
+        auto givSerialParam = request->getParam("GIVSERIAL", true);
+        if (givSerialParam != nullptr && !givSerialParam->value().isEmpty() &&
+            !givenergy_lv::valid_serial(givSerialParam->value().c_str())) {
+          request->send(400, "text/plain", "GivEnergy battery serial must be 10 letters or digits, or empty.");
           return;
         }
 

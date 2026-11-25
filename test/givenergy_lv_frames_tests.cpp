@@ -217,3 +217,15 @@ TEST(GivEnergyLvFrames, Block2CapacityIsSentAsA32BitValue) {
   EXPECT_EQ(block2[4 + 15], 0xE8);
   EXPECT_EQ(block2[4 + 16], 0x48);
 }
+
+TEST(GivEnergyLvFrames, ASerialSettingMustBeTenLettersOrDigits) {
+  EXPECT_TRUE(givenergy_lv::valid_serial("EM2026G001"));
+  EXPECT_TRUE(givenergy_lv::valid_serial("DX2319G000"));  // a real battery's
+  EXPECT_TRUE(givenergy_lv::valid_serial("dx2319g000"));
+  EXPECT_FALSE(givenergy_lv::valid_serial(""));
+  EXPECT_FALSE(givenergy_lv::valid_serial("DX2319G00"));    // would be padded with a space
+  EXPECT_FALSE(givenergy_lv::valid_serial("DX2319G0001"));  // would be cut
+  EXPECT_FALSE(givenergy_lv::valid_serial("DX2319 000"));
+  EXPECT_FALSE(givenergy_lv::valid_serial("DX2319/000"));
+  EXPECT_FALSE(givenergy_lv::valid_serial("DX2319\303\25100"));  // 10 bytes, with an e-acute in UTF-8
+}

@@ -192,6 +192,7 @@ void init_stored_settings() {
   user_selected_tesla_GTW_packEnergy = settings.getUInt("GTWPACK", user_selected_tesla_GTW_packEnergy);
   user_selected_primo_gen24 = settings.getBool("PRIMOGEN24", false);
   user_selected_accept_inverter_reboot = settings.getBool("INVACCREB", false);
+  user_selected_givenergy_lv_serial = settings.getString("GIVSERIAL").c_str();
   // Watchdog period the inverter last told us about, or the default if it never has
   inverter_modbus_watchdog_timeout_s = settings.getUInt("INVWDTMO", MODBUS_INV_WATCHDOG_DEFAULT_S);
 

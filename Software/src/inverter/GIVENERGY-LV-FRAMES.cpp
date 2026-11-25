@@ -141,6 +141,18 @@ bool is_request(const uint8_t* frame) {
   return crc16(frame, 6) == (frame[6] | frame[7] << 8);
 }
 
+bool valid_serial(const char* serial) {
+  size_t len = 0;
+  for (; serial[len] != '\0'; len++) {
+    const char c = serial[len];
+    const bool alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    if (!alnum || len == kSerialLen) {
+      return false;
+    }
+  }
+  return len == kSerialLen;
+}
+
 size_t build_reply(const uint8_t* request, const Snapshot& s, uint8_t* out) {
   const uint8_t device = request[0];
   const uint8_t function = request[1];
