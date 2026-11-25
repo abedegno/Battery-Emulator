@@ -290,3 +290,104 @@ TEST(GrowattLvCellCount, Frame0x319AloneLeavesCellCountAtZero) {
 
   EXPECT_EQ(datalayer.battery.info.number_of_cells, 0);
 }
+
+// ---- Protection causes (0x312) ----
+//
+// 0x312 bytes 0 and 1 are the protection bytes, bytes 2 and 3 the matching warnings (protocol
+// V1.04, tables 1 to 4). The temperature protections in each direction and the discharge
+// over-current protection are published as bms_protection, for inverter protocols that pass the
+// cause of a stop on. Bit positions are from the document only: no capture shows them set.
+
+static CAN_frame Frame312(uint8_t prot1, uint8_t prot2, uint8_t warn1 = 0, uint8_t warn2 = 0) {
+  return Frame(0x312, {prot1, prot2, warn1, warn2, 0x01, 0x00, 0x00, 0x10});
+}
+
+static bool NoCause() {
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  return !p.charge_over_temperature && !p.charge_under_temperature && !p.discharge_over_temperature &&
+         !p.discharge_under_temperature && !p.discharge_over_current;
+}
+
+TEST(GrowattLvProtectionCauses, NoneBeforeAnyFrame) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+}
+
+TEST(GrowattLvProtectionCauses, Prot1Bit7IsDischargeOverCurrent) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x80, 0x00));
+  b.update_values();
+  EXPECT_TRUE(datalayer.battery.status.bms_protection.discharge_over_current);
+  EXPECT_FALSE(datalayer.battery.status.bms_protection.discharge_over_temperature);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit7IsDischargeOverTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x80));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.discharge_over_temperature);
+  EXPECT_FALSE(p.charge_over_temperature || p.discharge_under_temperature || p.charge_under_temperature ||
+               p.discharge_over_current);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit6IsChargeOverTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x40));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.charge_over_temperature);
+  EXPECT_FALSE(p.discharge_over_temperature || p.discharge_under_temperature || p.charge_under_temperature ||
+               p.discharge_over_current);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit5IsDischargeUnderTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x20));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.discharge_under_temperature);
+  EXPECT_FALSE(p.charge_over_temperature || p.discharge_over_temperature || p.charge_under_temperature ||
+               p.discharge_over_current);
+}
+
+TEST(GrowattLvProtectionCauses, Prot2Bit4IsChargeUnderTemperature) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x00, 0x10));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.charge_under_temperature);
+  EXPECT_FALSE(p.charge_over_temperature || p.discharge_over_temperature || p.discharge_under_temperature ||
+               p.discharge_over_current);
+}
+
+// The other protection bits (charge over-current, short circuit, cell and pack voltages, soft
+// start, system error, cell difference) and every warning bit leave the causes clear.
+TEST(GrowattLvProtectionCauses, OtherProtectionsAndAllWarningsAreNotCauses) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x7F, 0x0F, 0xFF, 0xFF));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+  EXPECT_FALSE(datalayer.system.status.battery_allows_contactor_closing);
+}
+
+TEST(GrowattLvProtectionCauses, CausesClearWhenTheProtectionEnds) {
+  datalayer = DataLayer();
+  GrowattLvBattery b;
+  b.handle_incoming_can_frame(Frame312(0x80, 0xF0));
+  b.update_values();
+  const DATALAYER_BMS_PROTECTION_TYPE& p = datalayer.battery.status.bms_protection;
+  EXPECT_TRUE(p.discharge_over_current && p.discharge_over_temperature && p.charge_over_temperature &&
+              p.discharge_under_temperature && p.charge_under_temperature);
+  b.handle_incoming_can_frame(Frame312(0x00, 0x00));
+  b.update_values();
+  EXPECT_TRUE(NoCause());
+}

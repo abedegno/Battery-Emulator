@@ -93,6 +93,18 @@ class GrowattLvBattery : public CanBattery {
   static const uint16_t CELL_MV_PLAUSIBLE_MIN = 1000;
   static const uint16_t CELL_MV_PLAUSIBLE_MAX = 5000;
 
+  // 0x312 byte 0 (protection table 1): bit 7 discharge over-current, bit 6 charge over-current,
+  // bit 5 discharge short circuit, bit 4 cell over-voltage, bit 3 cell under-voltage, bit 2 pack
+  // over-voltage, bit 1 pack under-voltage, bit 0 soft start failed. Byte 1 (table 2): bit 7
+  // discharge over-temperature, bit 6 charge over-temperature, bit 5 discharge under-temperature,
+  // bit 4 charge under-temperature, bit 3 system error, bit 2 cell difference. Bytes 2 and 3 are
+  // the matching warnings. Only the bits below are published (see update_values()).
+  static const uint8_t PROT1_DISCHARGE_OVER_CURRENT = 0x80;
+  static const uint8_t PROT2_DISCHARGE_OVER_TEMPERATURE = 0x80;
+  static const uint8_t PROT2_CHARGE_OVER_TEMPERATURE = 0x40;
+  static const uint8_t PROT2_DISCHARGE_UNDER_TEMPERATURE = 0x20;
+  static const uint8_t PROT2_CHARGE_UNDER_TEMPERATURE = 0x10;
+
   // 0x315-0x318 carry exactly 16 cell voltages (cells 1-16).
   static const uint8_t PER_CELL_FRAME_CELLS = 16;
 

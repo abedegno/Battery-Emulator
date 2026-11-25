@@ -240,6 +240,16 @@ void GrowattLvBattery::update_values() {
   // charge_en/discharge_en together - a BMS legitimately enables only one
   // direction near the SOC extremes, which isn't a fault.
   datalayer.system.status.battery_allows_contactor_closing = have_311 && (prot1 == 0) && (prot2 == 0);
+
+  // The protection causes an inverter protocol may pass on (see bms_protection in datalayer.h).
+  // Bit positions are from the protocol document (V1.04, 0x312 tables 1 and 2); no capture yet
+  // shows them set.
+  auto& causes = datalayer.battery.status.bms_protection;
+  causes.discharge_over_current = (prot1 & PROT1_DISCHARGE_OVER_CURRENT) != 0;
+  causes.discharge_over_temperature = (prot2 & PROT2_DISCHARGE_OVER_TEMPERATURE) != 0;
+  causes.charge_over_temperature = (prot2 & PROT2_CHARGE_OVER_TEMPERATURE) != 0;
+  causes.discharge_under_temperature = (prot2 & PROT2_DISCHARGE_UNDER_TEMPERATURE) != 0;
+  causes.charge_under_temperature = (prot2 & PROT2_CHARGE_UNDER_TEMPERATURE) != 0;
 }
 
 void GrowattLvBattery::transmit_can(unsigned long currentMillis) {
